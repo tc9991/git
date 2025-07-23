@@ -17,7 +17,7 @@ static const char usage_str[] =
 
 int cmd__delta(int argc, const char **argv)
 {
-	int fd;
+	int fd = -1;
 	struct stat st;
 	void *from_buf = NULL, *data_buf = NULL, *out_buf = NULL;
 	unsigned long from_size, data_size, out_size;
@@ -31,13 +31,12 @@ int cmd__delta(int argc, const char **argv)
 	fd = open(argv[2], O_RDONLY);
 	if (fd < 0 || fstat(fd, &st)) {
 		perror(argv[2]);
-		return 1;
+		goto cleanup;
 	}
 	from_size = st.st_size;
 	from_buf = xmalloc(from_size);
 	if (read_in_full(fd, from_buf, from_size) < 0) {
 		perror(argv[2]);
-		close(fd);
 		goto cleanup;
 	}
 	close(fd);
@@ -51,7 +50,6 @@ int cmd__delta(int argc, const char **argv)
 	data_buf = xmalloc(data_size);
 	if (read_in_full(fd, data_buf, data_size) < 0) {
 		perror(argv[3]);
-		close(fd);
 		goto cleanup;
 	}
 	close(fd);
@@ -80,6 +78,9 @@ cleanup:
 	free(from_buf);
 	free(data_buf);
 	free(out_buf);
+
+	if (fd >= 0)
+		close(fd);
 
 	return ret;
 }
