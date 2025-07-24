@@ -7,6 +7,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LANG: zh_CN.UTF-8
+      LLVM_CONFIG_PATH: /usr/lib/llvm-17/bin/llvm-config
+      LLVM_SYS_170_PREFIX: /usr/lib/llvm-17/
 
     steps:
       - name: 终端汉化
@@ -16,7 +18,7 @@ jobs:
    
       - name: 安装依赖
         run: |
-          sudo apt-get install curl expat gettext openssl zlib1g-dev gcc perl make libssl-dev libcurl4-gnutls-dev libexpat1-dev bear
+          sudo apt-get install curl expat gettext openssl zlib1g-dev gcc perl make libssl-dev libcurl4-gnutls-dev libexpat1-dev bear llvm-17-dev clang-17 libclang-17-dev
 
       - name: 安装 Rust
         uses: actions-rs/toolchain@v1
