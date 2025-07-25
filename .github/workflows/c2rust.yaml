@@ -41,3 +41,8 @@ jobs:
       - name: 转换
         run: |
           c2rust transpile compile_commands.json
+
+      - name: 查看文件树
+        run: |
+          tree
+          tree > tree.txt
