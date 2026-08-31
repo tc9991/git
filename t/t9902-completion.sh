@@ -11,9 +11,9 @@ test_description='test bash completion'
 # untraceable with such ancient Bash versions.
 test_untraceable=UnfortunatelyYes
 
-# Override environment and always use master for the default initial branch
+# Override environment and always use main for the default initial branch
 # name for these tests, so that rev completion candidates are as expected.
-GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=master
+GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
 export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 
 . ./lib-bash.sh
@@ -590,12 +590,10 @@ test_expect_success '__gitcomp - doesnt fail because of invalid variable name' '
 	__gitcomp "$invalid_variable_name"
 '
 
-read -r -d "" refs <<-\EOF
-main
+refs='main
 maint
 next
-seen
-EOF
+seen'
 
 test_expect_success '__gitcomp_nl - trailing space' '
 	test_gitcomp_nl "m" "$refs" <<-EOF
@@ -1383,7 +1381,7 @@ test_expect_success '__git_complete_worktree_paths' '
 	test_when_finished "git worktree remove other_wt" &&
 	git worktree add --orphan other_wt &&
 	run_completion "git worktree remove " &&
-	grep other_wt out
+	test_grep other_wt out
 '
 
 test_expect_success '__git_complete_worktree_paths - not a git repository' '
@@ -1399,7 +1397,7 @@ test_expect_success '__git_complete_worktree_paths with -C' '
 	test_when_finished "git -C otherrepo worktree remove otherrepo_wt" &&
 	git -C otherrepo worktree add --orphan otherrepo_wt &&
 	run_completion "git -C otherrepo worktree remove " &&
-	grep otherrepo_wt out
+	test_grep otherrepo_wt out
 '
 
 test_expect_success 'git switch - with no options, complete local branches and unique remote branch names for DWIM logic' '
@@ -1453,7 +1451,7 @@ test_expect_success 'git bisect - start subcommand arguments before double-dash 
 		HEAD Z
 		final Z
 		initial Z
-		master Z
+		main Z
 		EOF
 	)
 '
@@ -2446,7 +2444,7 @@ test_expect_success FUNNYNAMES \
 	>repeated-quoted/2-file &&
 	>repeated-quoted/3\"file &&   # ... and here, too.
 
-	# Still, we shold only list the directory name only once.
+	# Still, we should list the directory name only once.
 	test_path_completion repeated repeated-quoted
 '
 
@@ -2556,14 +2554,14 @@ test_expect_success '__git_pretty_aliases' '
 test_expect_success 'basic' '
 	run_completion "git " &&
 	# built-in
-	grep -q "^add \$" out &&
+	test_grep -q "^add \$" out &&
 	# script
-	grep -q "^rebase \$" out &&
+	test_grep -q "^rebase \$" out &&
 	# plumbing
-	! grep -q "^ls-files \$" out &&
+	test_grep ! -q "^ls-files \$" out &&
 
 	run_completion "git r" &&
-	! grep -q -v "^r" out
+	test_grep ! -q -v "^r" out
 '
 
 test_expect_success 'double dash "git" itself' '
@@ -2596,9 +2594,12 @@ test_expect_success 'double dash "git checkout"' '
 	--merge Z
 	--conflict=Z
 	--patch Z
+	--unified=Z
+	--inter-hunk-context=Z
 	--ignore-skip-worktree-bits Z
 	--ignore-other-worktrees Z
 	--recurse-submodules Z
+	--auto-advance Z
 	--progress Z
 	--guess Z
 	--no-guess Z
@@ -2655,13 +2656,15 @@ test_expect_success 'git --help completion' '
 test_expect_success 'completion.commands removes multiple commands' '
 	test_config completion.commands "-cherry -mergetool" &&
 	git --list-cmds=list-mainporcelain,list-complete,config >out &&
-	! grep -E "^(cherry|mergetool)$" out
+	test_grep ! -E "^(cherry|mergetool)$" out
 '
 
 test_expect_success 'setup for integration tests' '
 	echo content >file1 &&
 	echo more >file2 &&
 	git add file1 file2 &&
+	echo untracked >file3 &&
+	echo untracked >ufile &&
 	git commit -m one &&
 	git branch mybranch &&
 	git tag mytag
@@ -2708,6 +2711,118 @@ test_expect_success 'checkout completes pseudo refs case insensitively with GIT_
 test_expect_success 'git -C <path> checkout uses the right repo' '
 	test_completion "git -C subdir -C subsubdir -C .. -C ../otherrepo checkout b" <<-\EOF
 	branch-in-other Z
+	EOF
+'
+
+test_expect_success 'git checkout completes tracked paths when no refs match' '
+	# file1 and file2 are tracked but file3 is not
+	# there is no ref that begins with f
+	test_completion "git checkout f" <<-\EOF &&
+	file1
+	file2
+	EOF
+	test_completion "git checkout -- f" <<-\EOF
+	file1
+	file2
+	EOF
+'
+
+test_expect_success 'git checkout completes untracked paths, too' '
+	# ufile is not tracked and there is no ref that begins with u
+	test_completion "git checkout u" <<-\EOF &&
+	ufile
+	EOF
+	test_completion "git checkout -- u" <<-\EOF
+	ufile
+	EOF
+'
+
+test_expect_success 'git -C <path> checkout completes paths in specified repo' '
+	# otherfile is tracked, oops is not
+	# lostfile is tracked but lost, ufile is untracked.
+	test_when_finished "rm -rf repo-for-checkout" &&
+	git init repo-for-checkout &&
+	echo content >repo-for-checkout/otherfile &&
+	echo content >repo-for-checkout/lostfile &&
+	git -C repo-for-checkout add otherfile &&
+	git -C repo-for-checkout add lostfile &&
+	git -C repo-for-checkout commit -m otherfile &&
+	echo untracked >repo-for-checkout/oops &&
+	echo untracked >repo-for-checkout/ufile &&
+	rm -f repo-for-checkout/lostfile &&
+	test_completion "git -C repo-for-checkout checkout o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout -- o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout -- l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout u" <<-\EOF &&
+	ufile
+	EOF
+	test_completion "git -C repo-for-checkout checkout -- u" <<-\EOF
+	ufile
+	EOF
+'
+
+test_expect_success 'git diff completes tracked paths when no refs match' '
+	# file1 and file2 are tracked but file3 is not
+	# there is no ref that begins with f
+	test_completion "git diff f" <<-\EOF &&
+	file1
+	file2
+	EOF
+	test_completion "git diff -- f" <<-\EOF
+	file1
+	file2
+	EOF
+'
+
+test_expect_success 'git diff [--] completes untracked paths, too' '
+	# ufile is not tracked and there is no ref that begins with u
+	test_completion "git diff u" <<-\EOF &&
+	ufile
+	EOF
+	test_completion "git diff -- u" <<-\EOF
+	ufile
+	EOF
+'
+
+test_expect_success 'git -C <path> diff completes paths in specified repo' '
+	test_when_finished "rm -rf repo-for-diff" &&
+	git init repo-for-diff &&
+	echo content >repo-for-diff/otherfile &&
+	echo content >repo-for-diff/lostfile &&
+	git -C repo-for-diff add otherfile &&
+	git -C repo-for-diff add lostfile &&
+	git -C repo-for-diff commit -m otherfile &&
+	echo untracked >repo-for-diff/oops &&
+	echo untracked >repo-for-diff/ufile &&
+	rm -f repo-for-diff/lostfile &&
+
+	test_completion "git -C repo-for-diff diff o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-diff diff l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-diff diff u" <<-\EOF &&
+	ufile
+	EOF
+
+	test_completion "git -C repo-for-diff diff -- o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-diff diff -- l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-diff diff -- u" <<-\EOF
+	ufile
 	EOF
 '
 
@@ -3051,6 +3166,7 @@ test_expect_success 'git config set - variable name - __git_compute_second_level
 	submodule.sub.fetchRecurseSubmodules Z
 	submodule.sub.ignore Z
 	submodule.sub.active Z
+	submodule.sub.gitdir Z
 	EOF
 '
 
@@ -3177,8 +3293,8 @@ test_expect_success 'plumbing commands are excluded without GIT_COMPLETION_SHOW_
 
 		# Just mainporcelain, not plumbing commands
 		run_completion "git c" &&
-		grep checkout out &&
-		! grep cat-file out
+		test_grep checkout out &&
+		test_grep ! cat-file out
 	)
 '
 
@@ -3191,13 +3307,13 @@ test_expect_success 'all commands are shown with GIT_COMPLETION_SHOW_ALL_COMMAND
 
 		# Both mainporcelain and plumbing commands
 		run_completion "git c" &&
-		grep checkout out &&
-		grep cat-file out &&
+		test_grep checkout out &&
+		test_grep cat-file out &&
 
 		# Check "gitk", a "main" command, but not a built-in + more plumbing
 		run_completion "git g" &&
-		grep gitk out &&
-		grep get-tar-commit-id out
+		test_grep gitk out &&
+		test_grep get-tar-commit-id out
 	)
 '
 

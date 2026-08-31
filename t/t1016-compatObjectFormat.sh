@@ -8,6 +8,12 @@ test_description='Test how well compatObjectFormat works'
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-gpg.sh
 
+if ! test_have_prereq RUST
+then
+	skip_all='interoperability requires a Git built with Rust'
+	test_done
+fi
+
 # All of the follow variables must be defined in the environment:
 # GIT_AUTHOR_NAME
 # GIT_AUTHOR_EMAIL
@@ -21,6 +27,12 @@ test_description='Test how well compatObjectFormat works'
 # different hash functions result in the same content in the commits.
 # This means that when the commit is translated between hash functions
 # the commit is identical to the commit in the other repository.
+#
+# Similarly this test relies on:
+#	gpg --faked-system-time '20230918T154812!
+# freezing the system time from gpg perspective so that two different
+# runs of gpg applied to the same data result in identical signatures.
+#
 
 compat_hash () {
 	case "$1" in
@@ -114,7 +126,7 @@ do
 		git config core.repositoryformatversion 1 &&
 		git config extensions.objectformat $hash &&
 		git config extensions.compatobjectformat $(compat_hash $hash) &&
-		test_config gpg.program $TEST_DIRECTORY/t1016/gpg &&
+		git config gpg.program $TEST_DIRECTORY/t1016/gpg &&
 		echo "Hello World!" >hello &&
 		eval hello_${hash}_oid=$(git hash-object hello) &&
 		git update-index --add hello &&
@@ -174,6 +186,24 @@ do
 		git cat-file tag signedtag34 | del_sigtag "${hash}" sha1 >../${hash}_signedtag4 &&
 		eval signedtag3_${hash}_oid=$(git hash-object -t tag -w ../${hash}_signedtag3) &&
 		eval signedtag4_${hash}_oid=$(git hash-object -t tag -w ../${hash}_signedtag4)
+	'
+
+	test_expect_success 'rev-parse maps oid of object borrowed from alternate' '
+		for repo in alt borrow
+		do
+			test_when_finished "rm -rf $repo" &&
+			git init --object-format=$hash $repo &&
+			git -C $repo config set core.repositoryformatversion 1 &&
+			git -C $repo config set extensions.compatObjectFormat $(compat_hash $hash) || exit 1
+		done &&
+
+		git -C alt commit --allow-empty --message A &&
+		echo "$(pwd)/alt/.git/objects" >borrow/.git/objects/info/alternates &&
+
+		oid=$(git -C alt rev-parse HEAD) &&
+		git -C alt    rev-parse --output-object-format=$(compat_hash $hash) "$oid" >expect &&
+		git -C borrow rev-parse --output-object-format=$(compat_hash $hash) "$oid" >actual &&
+		test_cmp expect actual
 	'
 done
 cd "$base"

@@ -15,8 +15,6 @@ enum branch_track {
 	BRANCH_TRACK_SIMPLE,
 };
 
-extern enum branch_track git_branch_track;
-
 /* Functions for acting on the information about branches. */
 
 /**
@@ -107,6 +105,12 @@ void create_branches_recursively(struct repository *r, const char *name,
  * then return the path to that worktree.
  */
 const char *branch_checked_out(const char *refname);
+
+/*
+ * If the branch at 'refname' is currently used for bisecting in a
+ * worktree, then return the path to that worktree.
+ */
+const char *branch_bisecting(const char *refname);
 
 /*
  * Check if 'name' can be a valid name for a branch; die otherwise.

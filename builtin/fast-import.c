@@ -30,6 +30,7 @@
 #include "khash.h"
 #include "date.h"
 #include "gpg-interface.h"
+#include "parse-options.h"
 
 #define PACK_ID_BITS 16
 #define MAX_PACK_ID ((1<<PACK_ID_BITS)-1)
@@ -182,11 +183,12 @@ static unsigned long branch_count;
 static unsigned long branch_load_count;
 static int failure;
 static FILE *pack_edges;
-static unsigned int show_stats = 1;
-static unsigned int quiet;
-static int global_argc;
-static const char **global_argv;
-static const char *global_prefix;
+static int show_stats = 1;
+static int quiet;
+static enum sign_mode signed_tag_mode = SIGN_VERBATIM;
+static enum sign_mode signed_commit_mode = SIGN_VERBATIM;
+static const char *signed_commit_keyid;
+static const char *signed_tag_keyid;
 
 /* Memory pools */
 static struct mem_pool fi_mem_pool = {
@@ -256,9 +258,7 @@ static struct recent_command *rc_free;
 static unsigned int cmd_save = 100;
 static uintmax_t next_mark;
 static struct strbuf new_data = STRBUF_INIT;
-static int seen_data_command;
 static int require_explicit_termination;
-static int allow_unsafe_features;
 
 /* Signal handling */
 static volatile sig_atomic_t checkpoint_requested;
@@ -271,10 +271,33 @@ static kh_oid_map_t *sub_oid_map;
 /* Where to write output of cat-blob commands */
 static int cat_blob_fd = STDOUT_FILENO;
 
-static void parse_argv(void);
-static void parse_get_mark(const char *p);
-static void parse_cat_blob(const char *p);
-static void parse_ls(const char *p, struct branch *b);
+/* Command state */
+struct fast_import_state {
+	int argc;
+	const char **argv;
+	const char *prefix;
+	int seen_data_command;
+	int allow_unsafe_features;
+	struct option *option;
+};
+
+static void fast_import_state_init(struct fast_import_state *state,
+				   int argc, const char **argv,
+				   const char *prefix, struct option *option)
+{
+	memset(state, 0, sizeof(*state));
+	state->argc = argc;
+	state->argv = argv;
+	state->prefix = prefix;
+	state->option = option;
+}
+
+static void parse_argv(struct fast_import_state *state);
+static void parse_get_mark(struct fast_import_state *state, const char *p);
+static void parse_cat_blob(struct fast_import_state *state, const char *p);
+static void parse_ls(struct fast_import_state *state,
+		     const char *p,
+		     struct branch *b);
 
 static void for_each_mark(struct mark_set *m, uintmax_t base, each_mark_fn_t callback, void *p)
 {
@@ -336,12 +359,12 @@ static void write_crash_report(const char *err)
 	struct recent_command *rc;
 
 	if (!rpt) {
-		error_errno("can't write crash report %s", loc);
+		error_errno(_("can't write crash report %s"), loc);
 		free(loc);
 		return;
 	}
 
-	fprintf(stderr, "fast-import: dumping crash report to %s\n", loc);
+	fprintf(stderr, _("fast-import: dumping crash report to %s\n"), loc);
 
 	fprintf(rpt, "fast-import crash report:\n");
 	fprintf(rpt, "    fast-import process: %"PRIuMAX"\n", (uintmax_t) getpid());
@@ -585,7 +608,7 @@ static void *find_mark(struct mark_set *s, uintmax_t idnum)
 			oe = s->data.marked[idnum];
 	}
 	if (!oe)
-		die("mark :%" PRIuMAX " not declared", orig_idnum);
+		die(_("mark :%" PRIuMAX " not declared"), orig_idnum);
 	return oe;
 }
 
@@ -625,9 +648,9 @@ static struct branch *new_branch(const char *name)
 	struct branch *b = lookup_branch(name);
 
 	if (b)
-		die("Invalid attempt to create duplicate branch: %s", name);
+		die(_("invalid attempt to create duplicate branch: %s"), name);
 	if (check_refname_format(name, REFNAME_ALLOW_ONELEVEL))
-		die("Branch name doesn't conform to GIT standards: %s", name);
+		die(_("branch name doesn't conform to Git standards: %s"), name);
 
 	b = mem_pool_calloc(&fi_mem_pool, 1, sizeof(struct branch));
 	b->name = mem_pool_strdup(&fi_mem_pool, name);
@@ -798,7 +821,7 @@ static const char *create_index(void)
 				*c++ = &e->idx;
 	last = idx + object_count;
 	if (c != last)
-		die("internal consistency error creating the index");
+		die(_("internal consistency error creating the index"));
 
 	tmpfile = write_idx_file(the_repository, NULL, idx, object_count,
 				 &pack_idx_opts, pack_data->hash);
@@ -816,18 +839,18 @@ static char *keep_pack(const char *curr_index_name)
 	keep_fd = safe_create_file_with_leading_directories(pack_data->repo,
 							    name.buf);
 	if (keep_fd < 0)
-		die_errno("cannot create keep file");
+		die_errno(_("cannot create keep file"));
 	write_or_die(keep_fd, keep_msg, strlen(keep_msg));
 	if (close(keep_fd))
-		die_errno("failed to write keep file");
+		die_errno(_("failed to write keep file"));
 
 	odb_pack_name(pack_data->repo, &name, pack_data->hash, "pack");
-	if (finalize_object_file(pack_data->pack_name, name.buf))
-		die("cannot store pack file");
+	if (finalize_object_file(pack_data->repo, pack_data->pack_name, name.buf))
+		die(_("cannot store pack file"));
 
 	odb_pack_name(pack_data->repo, &name, pack_data->hash, "idx");
-	if (finalize_object_file(curr_index_name, name.buf))
-		die("cannot store index file");
+	if (finalize_object_file(pack_data->repo, curr_index_name, name.buf))
+		die(_("cannot store index file"));
 	free((void *)curr_index_name);
 	return strbuf_detach(&name, NULL);
 }
@@ -850,7 +873,7 @@ static int loosen_small_pack(const struct packed_git *p)
 	struct child_process unpack = CHILD_PROCESS_INIT;
 
 	if (lseek(p->pack_fd, 0, SEEK_SET) < 0)
-		die_errno("Failed seeking to start of '%s'", p->pack_name);
+		die_errno(_("failed seeking to start of '%s'"), p->pack_name);
 
 	unpack.in = p->pack_fd;
 	unpack.git_cmd = 1;
@@ -872,6 +895,7 @@ static void end_packfile(void)
 	running = 1;
 	clear_delta_base_cache();
 	if (object_count) {
+		struct odb_source_files *files = odb_source_files_downcast(pack_data->repo->objects->sources);
 		struct packed_git *new_p;
 		struct object_id cur_pack_oid;
 		char *idx_name;
@@ -897,11 +921,10 @@ static void end_packfile(void)
 		idx_name = keep_pack(create_index());
 
 		/* Register the packfile with core git's machinery. */
-		new_p = add_packed_git(pack_data->repo, idx_name, strlen(idx_name), 1);
+		new_p = packfile_store_load_pack(files->packed, idx_name, 1);
 		if (!new_p)
-			die("core git rejected index %s", idx_name);
+			die(_("core Git rejected index %s"), idx_name);
 		all_packs[pack_id] = new_p;
-		install_packed_git(the_repository, new_p);
 		free(idx_name);
 
 		/* Print the boundary */
@@ -952,17 +975,19 @@ static int store_object(
 	struct object_id *oidout,
 	uintmax_t mark)
 {
+	struct odb_source *source;
 	void *out, *delta;
 	struct object_entry *e;
 	unsigned char hdr[96];
 	struct object_id oid;
-	unsigned long hdrlen, deltalen;
+	unsigned long hdrlen, deltalen = 0;
 	struct git_hash_ctx c;
 	git_zstream s;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
 	hdrlen = format_object_header((char *)hdr, sizeof(hdr), type,
 				      dat->len);
-	the_hash_algo->init_fn(&c);
+	git_hash_init(&c, the_hash_algo);
 	git_hash_update(&c, hdr, hdrlen);
 	git_hash_update(&c, dat->buf, dat->len);
 	git_hash_final_oid(&oid, &c);
@@ -975,7 +1000,13 @@ static int store_object(
 	if (e->idx.offset) {
 		duplicate_count_by_type[type]++;
 		return 1;
-	} else if (find_oid_pack(&oid, get_all_packs(the_repository))) {
+	}
+
+	for (source = the_repository->objects->sources; source; source = source->next) {
+		struct odb_source_files *files = odb_source_files_downcast(source);
+
+		if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
+			continue;
 		e->type = type;
 		e->pack_id = MAX_PACK_ID;
 		e->idx.offset = 1; /* just not zero! */
@@ -985,15 +1016,17 @@ static int store_object(
 
 	if (last && last->data.len && last->data.buf && last->depth < max_depth
 		&& dat->len > the_hash_algo->rawsz) {
+		size_t deltalen_st;
 
 		delta_count_attempts_by_type[type]++;
 		delta = diff_delta(last->data.buf, last->data.len,
 			dat->buf, dat->len,
-			&deltalen, dat->len - the_hash_algo->rawsz);
+			&deltalen_st, dat->len - the_hash_algo->rawsz);
+		deltalen = cast_size_t_to_ulong(deltalen_st);
 	} else
 		delta = NULL;
 
-	git_deflate_init(&s, pack_compression_level);
+	git_deflate_init(&s, cfg->pack_compression_level);
 	if (delta) {
 		s.next_in = delta;
 		s.avail_in = deltalen;
@@ -1020,7 +1053,7 @@ static int store_object(
 		if (delta) {
 			FREE_AND_NULL(delta);
 
-			git_deflate_init(&s, pack_compression_level);
+			git_deflate_init(&s, cfg->pack_compression_level);
 			s.next_in = (void *)dat->buf;
 			s.avail_in = dat->len;
 			s.avail_out = git_deflate_bound(&s, s.avail_in);
@@ -1086,7 +1119,7 @@ static int store_object(
 static void truncate_pack(struct hashfile_checkpoint *checkpoint)
 {
 	if (hashfile_truncate(pack_file, checkpoint))
-		die_errno("cannot truncate pack to skip duplicate");
+		die_errno(_("cannot truncate pack to skip duplicate"));
 	pack_size = checkpoint->offset;
 }
 
@@ -1095,6 +1128,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	size_t in_sz = 64 * 1024, out_sz = 64 * 1024;
 	unsigned char *in_buf = xmalloc(in_sz);
 	unsigned char *out_buf = xmalloc(out_sz);
+	struct odb_source *source;
 	struct object_entry *e;
 	struct object_id oid;
 	unsigned long hdrlen;
@@ -1102,6 +1136,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	struct git_hash_ctx c;
 	git_zstream s;
 	struct hashfile_checkpoint checkpoint;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 	int status = Z_OK;
 
 	/* Determine if we should auto-checkpoint. */
@@ -1116,12 +1151,12 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 
 	hdrlen = format_object_header((char *)out_buf, out_sz, OBJ_BLOB, len);
 
-	the_hash_algo->init_fn(&c);
+	git_hash_init(&c, the_hash_algo);
 	git_hash_update(&c, out_buf, hdrlen);
 
 	crc32_begin(pack_file);
 
-	git_deflate_init(&s, pack_compression_level);
+	git_deflate_init(&s, cfg->pack_compression_level);
 
 	hdrlen = encode_in_pack_object_header(out_buf, out_sz, OBJ_BLOB, len);
 
@@ -1133,7 +1168,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 			size_t cnt = in_sz < len ? in_sz : (size_t)len;
 			size_t n = fread(in_buf, 1, cnt, stdin);
 			if (!n && feof(stdin))
-				die("EOF in data (%" PRIuMAX " bytes remaining)", len);
+				die(_("EOF in data (%" PRIuMAX " bytes remaining)"), len);
 
 			git_hash_update(&c, in_buf, n);
 			s.next_in = in_buf;
@@ -1157,7 +1192,7 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 		case Z_STREAM_END:
 			continue;
 		default:
-			die("unexpected deflate failure: %d", status);
+			die(_("unexpected deflate failure: %d"), status);
 		}
 	}
 	git_deflate_end(&s);
@@ -1174,26 +1209,34 @@ static void stream_blob(uintmax_t len, struct object_id *oidout, uintmax_t mark)
 	if (e->idx.offset) {
 		duplicate_count_by_type[OBJ_BLOB]++;
 		truncate_pack(&checkpoint);
+		goto out;
+	}
 
-	} else if (find_oid_pack(&oid, get_all_packs(the_repository))) {
+	for (source = the_repository->objects->sources; source; source = source->next) {
+		struct odb_source_files *files = odb_source_files_downcast(source);
+
+		if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
+			continue;
 		e->type = OBJ_BLOB;
 		e->pack_id = MAX_PACK_ID;
 		e->idx.offset = 1; /* just not zero! */
 		duplicate_count_by_type[OBJ_BLOB]++;
 		truncate_pack(&checkpoint);
-
-	} else {
-		e->depth = 0;
-		e->type = OBJ_BLOB;
-		e->pack_id = pack_id;
-		e->idx.offset = offset;
-		e->idx.crc32 = crc32_end(pack_file);
-		object_count++;
-		object_count_by_type[OBJ_BLOB]++;
+		goto out;
 	}
 
+	e->depth = 0;
+	e->type = OBJ_BLOB;
+	e->pack_id = pack_id;
+	e->idx.offset = offset;
+	e->idx.crc32 = crc32_end(pack_file);
+	object_count++;
+	object_count_by_type[OBJ_BLOB]++;
+
+out:
 	free(in_buf);
 	free(out_buf);
+	hashfile_checkpoint_release(&checkpoint);
 }
 
 /* All calls must be guarded by find_object() or find_mark() to
@@ -1219,6 +1262,8 @@ static void *gfi_unpack_entry(
 	unsigned long *sizep)
 {
 	enum object_type type;
+	size_t size_st = 0;
+	void *data;
 	struct packed_git *p = all_packs[oe->pack_id];
 	if (p == pack_data && p->pack_size < (pack_size + the_hash_algo->rawsz)) {
 		/* The object is stored in the packfile we are writing to
@@ -1240,7 +1285,10 @@ static void *gfi_unpack_entry(
 		 */
 		p->pack_size = pack_size + the_hash_algo->rawsz;
 	}
-	return unpack_entry(the_repository, p, oe->idx.offset, &type, sizep);
+	data = unpack_entry(the_repository, p, oe->idx.offset, &type, &size_st);
+	if (sizep)
+		*sizep = cast_size_t_to_ulong(size_st);
+	return data;
 }
 
 static void load_tree(struct tree_entry *root)
@@ -1259,16 +1307,19 @@ static void load_tree(struct tree_entry *root)
 	myoe = find_object(oid);
 	if (myoe && myoe->pack_id != MAX_PACK_ID) {
 		if (myoe->type != OBJ_TREE)
-			die("Not a tree: %s", oid_to_hex(oid));
+			die(_("not a tree: %s"), oid_to_hex(oid));
 		t->delta_depth = myoe->depth;
 		buf = gfi_unpack_entry(myoe, &size);
 		if (!buf)
-			die("Can't load tree %s", oid_to_hex(oid));
+			die(_("can't load tree %s"), oid_to_hex(oid));
 	} else {
 		enum object_type type;
-		buf = odb_read_object(the_repository->objects, oid, &type, &size);
+		size_t size_st = 0;
+		buf = odb_read_object(the_repository->objects, oid, &type,
+				      &size_st);
+		size = cast_size_t_to_ulong(size_st);
 		if (!buf || type != OBJ_TREE)
-			die("Can't load tree %s", oid_to_hex(oid));
+			die(_("can't load tree %s"), oid_to_hex(oid));
 	}
 
 	c = buf;
@@ -1282,7 +1333,7 @@ static void load_tree(struct tree_entry *root)
 		e->tree = NULL;
 		c = parse_mode(c, &e->versions[1].mode);
 		if (!c)
-			die("Corrupt mode in %s", oid_to_hex(oid));
+			die(_("corrupt mode in %s"), oid_to_hex(oid));
 		e->versions[0].mode = e->versions[1].mode;
 		e->name = to_atom(c, strlen(c));
 		c += e->name->str_len + 1;
@@ -1394,7 +1445,7 @@ static void tree_content_replace(
 	struct tree_content *newtree)
 {
 	if (!S_ISDIR(mode))
-		die("Root cannot be a non-directory");
+		die(_("root cannot be a non-directory"));
 	oidclr(&root->versions[0].oid, the_repository->hash_algo);
 	oidcpy(&root->versions[1].oid, oid);
 	if (root->tree)
@@ -1417,9 +1468,9 @@ static int tree_content_set(
 	slash1 = strchrnul(p, '/');
 	n = slash1 - p;
 	if (!n)
-		die("Empty path component found in input");
+		die(_("empty path component found in input"));
 	if (!*slash1 && !S_ISDIR(mode) && subtree)
-		die("Non-directories cannot have subtrees");
+		die(_("non-directories cannot have subtrees"));
 
 	if (!root->tree)
 		load_tree(root);
@@ -1571,7 +1622,7 @@ static int tree_content_get(
 	slash1 = strchrnul(p, '/');
 	n = slash1 - p;
 	if (!n && !allow_root)
-		die("Empty path component found in input");
+		die(_("empty path component found in input"));
 
 	if (!root->tree)
 		load_tree(root);
@@ -1617,8 +1668,8 @@ static int update_branch(struct branch *b)
 	    !strcmp(b->name + strlen(replace_prefix),
 		    oid_to_hex(&b->oid))) {
 		if (!quiet)
-			warning("Dropping %s since it would point to "
-				"itself (i.e. to %s)",
+			warning(_("dropping %s since it would point to "
+				  "itself (i.e. to %s)"),
 				b->name, oid_to_hex(&b->oid));
 		refs_delete_ref(get_main_ref_store(the_repository),
 				NULL, b->name, NULL, 0);
@@ -1641,14 +1692,14 @@ static int update_branch(struct branch *b)
 		new_cmit = lookup_commit_reference_gently(the_repository,
 							  &b->oid, 0);
 		if (!old_cmit || !new_cmit)
-			return error("Branch %s is missing commits.", b->name);
+			return error(_("branch %s is missing commits."), b->name);
 
 		ret = repo_in_merge_bases(the_repository, old_cmit, new_cmit);
 		if (ret < 0)
 			exit(128);
 		if (!ret) {
-			warning("Not updating %s"
-				" (new tip %s does not contain %s)",
+			warning(_("not updating %s"
+				  " (new tip %s does not contain %s)"),
 				b->name, oid_to_hex(&b->oid),
 				oid_to_hex(&old_oid));
 			return -1;
@@ -1724,13 +1775,13 @@ static void dump_marks(void)
 		return;
 
 	if (safe_create_leading_directories_const(the_repository, export_marks_file)) {
-		failure |= error_errno("unable to create leading directories of %s",
+		failure |= error_errno(_("unable to create leading directories of %s"),
 				       export_marks_file);
 		return;
 	}
 
 	if (hold_lock_file_for_update(&mark_lock, export_marks_file, 0) < 0) {
-		failure |= error_errno("Unable to write marks file %s",
+		failure |= error_errno(_("unable to write marks file %s"),
 				       export_marks_file);
 		return;
 	}
@@ -1739,14 +1790,14 @@ static void dump_marks(void)
 	if (!f) {
 		int saved_errno = errno;
 		rollback_lock_file(&mark_lock);
-		failure |= error("Unable to write marks file %s: %s",
+		failure |= error(_("unable to write marks file %s: %s"),
 			export_marks_file, strerror(saved_errno));
 		return;
 	}
 
 	for_each_mark(marks, 0, dump_marks_fn, f);
 	if (commit_lock_file(&mark_lock)) {
-		failure |= error_errno("Unable to write file %s",
+		failure |= error_errno(_("unable to write file %s"),
 				       export_marks_file);
 		return;
 	}
@@ -1760,7 +1811,7 @@ static void insert_object_entry(struct mark_set **s, struct object_id *oid, uint
 		enum object_type type = odb_read_object_info(the_repository->objects,
 							     oid, NULL);
 		if (type < 0)
-			die("object not found: %s", oid_to_hex(oid));
+			die(_("object not found: %s"), oid_to_hex(oid));
 		e = insert_object(oid);
 		e->type = type;
 		e->pack_id = MAX_PACK_ID;
@@ -1787,13 +1838,13 @@ static void read_mark_file(struct mark_set **s, FILE *f, mark_set_inserter_t ins
 
 		end = strchr(line, '\n');
 		if (line[0] != ':' || !end)
-			die("corrupt mark line: %s", line);
+			die(_("corrupt mark line: %s"), line);
 		*end = 0;
 		mark = strtoumax(line + 1, &end, 10);
 		if (!mark || end == line + 1
 			|| *end != ' '
 			|| get_oid_hex_any(end + 1, &oid) == GIT_HASH_UNKNOWN)
-			die("corrupt mark line: %s", line);
+			die(_("corrupt mark line: %s"), line);
 		inserter(s, &oid, mark);
 	}
 }
@@ -1806,7 +1857,7 @@ static void read_marks(void)
 	else if (import_marks_file_ignore_missing && errno == ENOENT)
 		goto done; /* Marks file does not exist */
 	else
-		die_errno("cannot read '%s'", import_marks_file);
+		die_errno(_("cannot read '%s'"), import_marks_file);
 	read_mark_file(&marks, f, insert_object_entry);
 	fclose(f);
 done:
@@ -1814,7 +1865,7 @@ done:
 }
 
 
-static int read_next_command(void)
+static int read_next_command(struct fast_import_state *state)
 {
 	static int stdin_eof = 0;
 
@@ -1833,10 +1884,10 @@ static int read_next_command(void)
 			if (stdin_eof)
 				return EOF;
 
-			if (!seen_data_command
+			if (!state->seen_data_command
 				&& !starts_with(command_buf.buf, "feature ")
 				&& !starts_with(command_buf.buf, "option ")) {
-				parse_argv();
+				parse_argv(state);
 			}
 
 			rc = rc_free;
@@ -1868,22 +1919,22 @@ static void skip_optional_lf(void)
 		ungetc(term_char, stdin);
 }
 
-static void parse_mark(void)
+static void parse_mark(struct fast_import_state *state)
 {
 	const char *v;
 	if (skip_prefix(command_buf.buf, "mark :", &v)) {
 		next_mark = strtoumax(v, NULL, 10);
-		read_next_command();
+		read_next_command(state);
 	}
 	else
 		next_mark = 0;
 }
 
-static void parse_original_identifier(void)
+static void parse_original_identifier(struct fast_import_state *state)
 {
 	const char *v;
 	if (skip_prefix(command_buf.buf, "original-oid ", &v))
-		read_next_command();
+		read_next_command(state);
 }
 
 static int parse_data(struct strbuf *sb, uintmax_t limit, uintmax_t *len_res)
@@ -1892,7 +1943,7 @@ static int parse_data(struct strbuf *sb, uintmax_t limit, uintmax_t *len_res)
 	strbuf_reset(sb);
 
 	if (!skip_prefix(command_buf.buf, "data ", &data))
-		die("Expected 'data n' command, found: %s", command_buf.buf);
+		die(_("expected 'data n' command, found: %s"), command_buf.buf);
 
 	if (skip_prefix(data, "<<", &data)) {
 		char *term = xstrdup(data);
@@ -1900,7 +1951,7 @@ static int parse_data(struct strbuf *sb, uintmax_t limit, uintmax_t *len_res)
 
 		for (;;) {
 			if (strbuf_getline_lf(&command_buf, stdin) == EOF)
-				die("EOF in data (terminator '%s' not found)", term);
+				die(_("EOF in data (terminator '%s' not found)"), term);
 			if (term_len == command_buf.len
 				&& !strcmp(term, command_buf.buf))
 				break;
@@ -1918,12 +1969,12 @@ static int parse_data(struct strbuf *sb, uintmax_t limit, uintmax_t *len_res)
 			return 0;
 		}
 		if (length < len)
-			die("data is too large to use in this context");
+			die(_("data is too large to use in this context"));
 
 		while (n < length) {
 			size_t s = strbuf_fread(sb, length - n, stdin);
 			if (!s && feof(stdin))
-				die("EOF in data (%lu bytes remaining)",
+				die(_("EOF in data (%lu bytes remaining)"),
 					(unsigned long)(length - n));
 			n += s;
 		}
@@ -1980,15 +2031,15 @@ static char *parse_ident(const char *buf)
 
 	ltgt = buf + strcspn(buf, "<>");
 	if (*ltgt != '<')
-		die("Missing < in ident string: %s", buf);
+		die(_("missing < in ident string: %s"), buf);
 	if (ltgt != buf && ltgt[-1] != ' ')
-		die("Missing space before < in ident string: %s", buf);
+		die(_("missing space before < in ident string: %s"), buf);
 	ltgt = ltgt + 1 + strcspn(ltgt + 1, "<>");
 	if (*ltgt != '>')
-		die("Missing > in ident string: %s", buf);
+		die(_("missing > in ident string: %s"), buf);
 	ltgt++;
 	if (*ltgt != ' ')
-		die("Missing space after > in ident string: %s", buf);
+		die(_("missing space after > in ident string: %s"), buf);
 	ltgt++;
 	name_len = ltgt - buf;
 	strbuf_add(&ident, buf, name_len);
@@ -1996,19 +2047,19 @@ static char *parse_ident(const char *buf)
 	switch (whenspec) {
 	case WHENSPEC_RAW:
 		if (validate_raw_date(ltgt, &ident, 1) < 0)
-			die("Invalid raw date \"%s\" in ident: %s", ltgt, buf);
+			die(_("invalid raw date \"%s\" in ident: %s"), ltgt, buf);
 		break;
 	case WHENSPEC_RAW_PERMISSIVE:
 		if (validate_raw_date(ltgt, &ident, 0) < 0)
-			die("Invalid raw date \"%s\" in ident: %s", ltgt, buf);
+			die(_("invalid raw date \"%s\" in ident: %s"), ltgt, buf);
 		break;
 	case WHENSPEC_RFC2822:
 		if (parse_date(ltgt, &ident) < 0)
-			die("Invalid rfc2822 date \"%s\" in ident: %s", ltgt, buf);
+			die(_("invalid rfc2822 date \"%s\" in ident: %s"), ltgt, buf);
 		break;
 	case WHENSPEC_NOW:
 		if (strcmp("now", ltgt))
-			die("Date in ident must be 'now': %s", buf);
+			die(_("date in ident must be 'now': %s"), buf);
 		datestamp(&ident);
 		break;
 	}
@@ -2037,11 +2088,11 @@ static void parse_and_store_blob(
 	}
 }
 
-static void parse_new_blob(void)
+static void parse_new_blob(struct fast_import_state *state)
 {
-	read_next_command();
-	parse_mark();
-	parse_original_identifier();
+	read_next_command(state);
+	parse_mark(state);
+	parse_original_identifier(state);
 	parse_and_store_blob(&last_blob, NULL, next_mark);
 }
 
@@ -2102,7 +2153,7 @@ static void construct_path_with_fanout(const char *hex_sha1,
 {
 	unsigned int i = 0, j = 0;
 	if (fanout >= the_hash_algo->rawsz)
-		die("Too large fanout (%u)", fanout);
+		die(_("too large fanout (%u)"), fanout);
 	while (fanout) {
 		path[i++] = hex_sha1[j++];
 		path[i++] = hex_sha1[j++];
@@ -2176,7 +2227,7 @@ static uintmax_t do_change_note_fanout(
 
 			/* Rename fullpath to realpath */
 			if (!tree_content_remove(orig_root, fullpath, &leaf, 0))
-				die("Failed to remove path %s", fullpath);
+				die(_("failed to remove path %s"), fullpath);
 			tree_content_set(orig_root, realpath,
 				&leaf.versions[1].oid,
 				leaf.versions[1].mode,
@@ -2249,7 +2300,7 @@ static uintmax_t parse_mark_ref(const char *p, char **endptr)
 	p++;
 	mark = strtoumax(p, endptr, 10);
 	if (*endptr == p)
-		die("No value after ':' in mark: %s", command_buf.buf);
+		die(_("no value after ':' in mark: %s"), command_buf.buf);
 	return mark;
 }
 
@@ -2264,7 +2315,7 @@ static uintmax_t parse_mark_ref_eol(const char *p)
 
 	mark = parse_mark_ref(p, &end);
 	if (*end != '\0')
-		die("Garbage after mark: %s", command_buf.buf);
+		die(_("garbage after mark: %s"), command_buf.buf);
 	return mark;
 }
 
@@ -2279,7 +2330,7 @@ static uintmax_t parse_mark_ref_space(const char **p)
 
 	mark = parse_mark_ref(*p, &end);
 	if (*end++ != ' ')
-		die("Missing space after mark: %s", command_buf.buf);
+		die(_("missing space after mark: %s"), command_buf.buf);
 	*p = end;
 	return mark;
 }
@@ -2295,9 +2346,9 @@ static void parse_path(struct strbuf *sb, const char *p, const char **endp,
 {
 	if (*p == '"') {
 		if (unquote_c_style(sb, p, endp))
-			die("Invalid %s: %s", field, command_buf.buf);
+			die(_("invalid %s: %s"), field, command_buf.buf);
 		if (strlen(sb->buf) != sb->len)
-			die("NUL in %s: %s", field, command_buf.buf);
+			die(_("NUL in %s: %s"), field, command_buf.buf);
 	} else {
 		/*
 		 * Unless we are parsing the last field of a line,
@@ -2320,7 +2371,7 @@ static void parse_path_eol(struct strbuf *sb, const char *p, const char *field)
 
 	parse_path(sb, p, &end, 1, field);
 	if (*end)
-		die("Garbage after %s: %s", field, command_buf.buf);
+		die(_("garbage after %s: %s"), field, command_buf.buf);
 }
 
 /*
@@ -2333,11 +2384,13 @@ static void parse_path_space(struct strbuf *sb, const char *p,
 {
 	parse_path(sb, p, endp, 0, field);
 	if (**endp != ' ')
-		die("Missing space after %s: %s", field, command_buf.buf);
+		die(_("missing space after %s: %s"), field, command_buf.buf);
 	(*endp)++;
 }
 
-static void file_change_m(const char *p, struct branch *b)
+static void file_change_m(struct fast_import_state *state,
+			  const char *p,
+			  struct branch *b)
 {
 	static struct strbuf path = STRBUF_INIT;
 	struct object_entry *oe;
@@ -2346,7 +2399,7 @@ static void file_change_m(const char *p, struct branch *b)
 
 	p = parse_mode(p, &mode);
 	if (!p)
-		die("Corrupt mode: %s", command_buf.buf);
+		die(_("corrupt mode: %s"), command_buf.buf);
 	switch (mode) {
 	case 0644:
 	case 0755:
@@ -2359,7 +2412,7 @@ static void file_change_m(const char *p, struct branch *b)
 		/* ok */
 		break;
 	default:
-		die("Corrupt mode: %s", command_buf.buf);
+		die(_("corrupt mode: %s"), command_buf.buf);
 	}
 
 	if (*p == ':') {
@@ -2370,10 +2423,10 @@ static void file_change_m(const char *p, struct branch *b)
 		oe = NULL; /* not used with inline_data, but makes gcc happy */
 	} else {
 		if (parse_mapped_oid_hex(p, &oid, &p))
-			die("Invalid dataref: %s", command_buf.buf);
+			die(_("invalid dataref: %s"), command_buf.buf);
 		oe = find_object(&oid);
 		if (*p++ != ' ')
-			die("Missing space after SHA1: %s", command_buf.buf);
+			die(_("missing space after SHA1: %s"), command_buf.buf);
 	}
 
 	strbuf_reset(&path);
@@ -2389,11 +2442,11 @@ static void file_change_m(const char *p, struct branch *b)
 
 	if (S_ISGITLINK(mode)) {
 		if (inline_data)
-			die("Git links cannot be specified 'inline': %s",
+			die(_("Git links cannot be specified 'inline': %s"),
 				command_buf.buf);
 		else if (oe) {
 			if (oe->type != OBJ_COMMIT)
-				die("Not a commit (actually a %s): %s",
+				die(_("not a commit (actually a %s): %s"),
 					type_name(oe->type), command_buf.buf);
 		}
 		/*
@@ -2402,12 +2455,12 @@ static void file_change_m(const char *p, struct branch *b)
 		 */
 	} else if (inline_data) {
 		if (S_ISDIR(mode))
-			die("Directories cannot be specified 'inline': %s",
+			die(_("directories cannot be specified 'inline': %s"),
 				command_buf.buf);
-		while (read_next_command() != EOF) {
+		while (read_next_command(state) != EOF) {
 			const char *v;
 			if (skip_prefix(command_buf.buf, "cat-blob ", &v))
-				parse_cat_blob(v);
+				parse_cat_blob(state, v);
 			else {
 				parse_and_store_blob(&last_blob, &oid, 0);
 				break;
@@ -2420,11 +2473,11 @@ static void file_change_m(const char *p, struct branch *b)
 					odb_read_object_info(the_repository->objects,
 							     &oid, NULL);
 		if (type < 0)
-			die("%s not found: %s",
-					S_ISDIR(mode) ?  "Tree" : "Blob",
-					command_buf.buf);
+			die(_("%s not found: %s"),
+			    S_ISDIR(mode) ?  _("tree") : _("blob"),
+			    command_buf.buf);
 		if (type != expected)
-			die("Not a %s (actually a %s): %s",
+			die(_("not a %s (actually a %s): %s"),
 				type_name(expected), type_name(type),
 				command_buf.buf);
 	}
@@ -2435,7 +2488,7 @@ static void file_change_m(const char *p, struct branch *b)
 	}
 
 	if (!verify_path(path.buf, mode))
-		die("invalid path '%s'", path.buf);
+		die(_("invalid path '%s'"), path.buf);
 	tree_content_set(&b->branch_tree, path.buf, &oid, mode, NULL);
 }
 
@@ -2465,7 +2518,7 @@ static void file_change_cr(const char *p, struct branch *b, int rename)
 	else
 		tree_content_get(&b->branch_tree, source.buf, &leaf, 1);
 	if (!leaf.versions[1].mode)
-		die("Path %s not in branch", source.buf);
+		die(_("path %s not in branch"), source.buf);
 	if (!*dest.buf) {	/* C "path/to/subdir" "" */
 		tree_content_replace(&b->branch_tree,
 			&leaf.versions[1].oid,
@@ -2474,14 +2527,17 @@ static void file_change_cr(const char *p, struct branch *b, int rename)
 		return;
 	}
 	if (!verify_path(dest.buf, leaf.versions[1].mode))
-		die("invalid path '%s'", dest.buf);
+		die(_("invalid path '%s'"), dest.buf);
 	tree_content_set(&b->branch_tree, dest.buf,
 		&leaf.versions[1].oid,
 		leaf.versions[1].mode,
 		leaf.tree);
 }
 
-static void note_change_n(const char *p, struct branch *b, unsigned char *old_fanout)
+static void note_change_n(struct fast_import_state *state,
+			  const char *p,
+			  struct branch *b,
+			  unsigned char *old_fanout)
 {
 	struct object_entry *oe;
 	struct branch *s;
@@ -2516,49 +2572,49 @@ static void note_change_n(const char *p, struct branch *b, unsigned char *old_fa
 		oe = NULL; /* not used with inline_data, but makes gcc happy */
 	} else {
 		if (parse_mapped_oid_hex(p, &oid, &p))
-			die("Invalid dataref: %s", command_buf.buf);
+			die(_("invalid dataref: %s"), command_buf.buf);
 		oe = find_object(&oid);
 		if (*p++ != ' ')
-			die("Missing space after SHA1: %s", command_buf.buf);
+			die(_("missing space after SHA1: %s"), command_buf.buf);
 	}
 
 	/* <commit-ish> */
 	s = lookup_branch(p);
 	if (s) {
 		if (is_null_oid(&s->oid))
-			die("Can't add a note on empty branch.");
+			die(_("can't add a note on empty branch."));
 		oidcpy(&commit_oid, &s->oid);
 	} else if (*p == ':') {
 		uintmax_t commit_mark = parse_mark_ref_eol(p);
 		struct object_entry *commit_oe = find_mark(marks, commit_mark);
 		if (commit_oe->type != OBJ_COMMIT)
-			die("Mark :%" PRIuMAX " not a commit", commit_mark);
+			die(_("mark :%" PRIuMAX " not a commit"), commit_mark);
 		oidcpy(&commit_oid, &commit_oe->idx.oid);
 	} else if (!repo_get_oid(the_repository, p, &commit_oid)) {
-		unsigned long size;
+		size_t size;
 		char *buf = odb_read_object_peeled(the_repository->objects,
 						   &commit_oid, OBJ_COMMIT, &size,
 						   &commit_oid);
 		if (!buf || size < the_hash_algo->hexsz + 6)
-			die("Not a valid commit: %s", p);
+			die(_("not a valid commit: %s"), p);
 		free(buf);
 	} else
-		die("Invalid ref name or SHA1 expression: %s", p);
+		die(_("invalid ref name or SHA1 expression: %s"), p);
 
 	if (inline_data) {
-		read_next_command();
+		read_next_command(state);
 		parse_and_store_blob(&last_blob, &oid, 0);
 	} else if (oe) {
 		if (oe->type != OBJ_BLOB)
-			die("Not a blob (actually a %s): %s",
+			die(_("not a blob (actually a %s): %s"),
 				type_name(oe->type), command_buf.buf);
 	} else if (!is_null_oid(&oid)) {
 		enum object_type type = odb_read_object_info(the_repository->objects, &oid,
 							NULL);
 		if (type < 0)
-			die("Blob not found: %s", command_buf.buf);
+			die(_("blob not found: %s"), command_buf.buf);
 		if (type != OBJ_BLOB)
-			die("Not a blob (actually a %s): %s",
+			die(_("not a blob (actually a %s): %s"),
 			    type_name(type), command_buf.buf);
 	}
 
@@ -2587,10 +2643,10 @@ static void file_change_deleteall(struct branch *b)
 static void parse_from_commit(struct branch *b, char *buf, unsigned long size)
 {
 	if (!buf || size < the_hash_algo->hexsz + 6)
-		die("Not a valid commit: %s", oid_to_hex(&b->oid));
+		die(_("not a valid commit: %s"), oid_to_hex(&b->oid));
 	if (memcmp("tree ", buf, 5)
 		|| get_oid_hex(buf + 5, &b->branch_tree.versions[1].oid))
-		die("The commit %s is corrupt", oid_to_hex(&b->oid));
+		die(_("the commit %s is corrupt"), oid_to_hex(&b->oid));
 	oidcpy(&b->branch_tree.versions[0].oid,
 	       &b->branch_tree.versions[1].oid);
 }
@@ -2602,16 +2658,20 @@ static void parse_from_existing(struct branch *b)
 		oidclr(&b->branch_tree.versions[1].oid, the_repository->hash_algo);
 	} else {
 		unsigned long size;
+		size_t size_st = 0;
 		char *buf;
 
 		buf = odb_read_object_peeled(the_repository->objects, &b->oid,
-					     OBJ_COMMIT, &size, &b->oid);
+					     OBJ_COMMIT, &size_st, &b->oid);
+		size = cast_size_t_to_ulong(size_st);
 		parse_from_commit(b, buf, size);
 		free(buf);
 	}
 }
 
-static int parse_objectish(struct branch *b, const char *objectish)
+static int parse_objectish(struct fast_import_state *state,
+			   struct branch *b,
+			   const char *objectish)
 {
 	struct branch *s;
 	struct object_id oid;
@@ -2620,7 +2680,7 @@ static int parse_objectish(struct branch *b, const char *objectish)
 
 	s = lookup_branch(objectish);
 	if (b == s)
-		die("Can't create a branch from itself: %s", b->name);
+		die(_("can't create a branch from itself: %s"), b->name);
 	else if (s) {
 		struct object_id *t = &s->branch_tree.versions[1].oid;
 		oidcpy(&b->oid, &s->oid);
@@ -2630,7 +2690,7 @@ static int parse_objectish(struct branch *b, const char *objectish)
 		uintmax_t idnum = parse_mark_ref_eol(objectish);
 		struct object_entry *oe = find_mark(marks, idnum);
 		if (oe->type != OBJ_COMMIT)
-			die("Mark :%" PRIuMAX " not a commit", idnum);
+			die(_("mark :%" PRIuMAX " not a commit"), idnum);
 		if (!oideq(&b->oid, &oe->idx.oid)) {
 			oidcpy(&b->oid, &oe->idx.oid);
 			if (oe->pack_id != MAX_PACK_ID) {
@@ -2647,38 +2707,41 @@ static int parse_objectish(struct branch *b, const char *objectish)
 			b->delete = 1;
 	}
 	else
-		die("Invalid ref name or SHA1 expression: %s", objectish);
+		die(_("invalid ref name or SHA1 expression: %s"), objectish);
 
 	if (b->branch_tree.tree && !oideq(&oid, &b->branch_tree.versions[1].oid)) {
 		release_tree_content_recursive(b->branch_tree.tree);
 		b->branch_tree.tree = NULL;
 	}
 
-	read_next_command();
+	read_next_command(state);
 	return 1;
 }
 
-static int parse_from(struct branch *b)
+static int parse_from(struct fast_import_state *state, struct branch *b)
 {
 	const char *from;
 
 	if (!skip_prefix(command_buf.buf, "from ", &from))
 		return 0;
 
-	return parse_objectish(b, from);
+	return parse_objectish(state, b, from);
 }
 
-static int parse_objectish_with_prefix(struct branch *b, const char *prefix)
+static int parse_objectish_with_prefix(struct fast_import_state *state,
+				       struct branch *b,
+				       const char *prefix)
 {
 	const char *base;
 
 	if (!skip_prefix(command_buf.buf, prefix, &base))
 		return 0;
 
-	return parse_objectish(b, base);
+	return parse_objectish(state, b, base);
 }
 
-static struct hash_list *parse_merge(unsigned int *count)
+static struct hash_list *parse_merge(struct fast_import_state *state,
+				     unsigned int *count)
 {
 	struct hash_list *list = NULL, **tail = &list, *n;
 	const char *from;
@@ -2694,25 +2757,25 @@ static struct hash_list *parse_merge(unsigned int *count)
 			uintmax_t idnum = parse_mark_ref_eol(from);
 			struct object_entry *oe = find_mark(marks, idnum);
 			if (oe->type != OBJ_COMMIT)
-				die("Mark :%" PRIuMAX " not a commit", idnum);
+				die(_("mark :%" PRIuMAX " not a commit"), idnum);
 			oidcpy(&n->oid, &oe->idx.oid);
 		} else if (!repo_get_oid(the_repository, from, &n->oid)) {
-			unsigned long size;
+			size_t size;
 			char *buf = odb_read_object_peeled(the_repository->objects,
 							   &n->oid, OBJ_COMMIT,
 							   &size, &n->oid);
 			if (!buf || size < the_hash_algo->hexsz + 6)
-				die("Not a valid commit: %s", from);
+				die(_("not a valid commit: %s"), from);
 			free(buf);
 		} else
-			die("Invalid ref name or SHA1 expression: %s", from);
+			die(_("invalid ref name or SHA1 expression: %s"), from);
 
 		n->next = NULL;
 		*tail = n;
 		tail = &n->next;
 
 		(*count)++;
-		read_next_command();
+		read_next_command(state);
 	}
 	return list;
 }
@@ -2723,14 +2786,16 @@ struct signature_data {
 	struct strbuf data;   /* The actual signature data */
 };
 
-static void parse_one_signature(struct signature_data *sig, const char *v)
+static void parse_one_signature(struct fast_import_state *state,
+				struct signature_data *sig,
+				const char *v)
 {
 	char *args = xstrdup(v); /* Will be freed when sig->hash_algo is freed */
 	char *space = strchr(args, ' ');
 
 	if (!space)
-		die("Expected gpgsig format: 'gpgsig <hash-algo> <signature-format>', "
-		    "got 'gpgsig %s'", args);
+		die(_("expected gpgsig format: 'gpgsig <hash-algo> <signature-format>', "
+		      "got 'gpgsig %s'"), args);
 	*space = '\0';
 
 	sig->hash_algo = args;
@@ -2739,17 +2804,26 @@ static void parse_one_signature(struct signature_data *sig, const char *v)
 	/* Validate hash algorithm */
 	if (strcmp(sig->hash_algo, "sha1") &&
 	    strcmp(sig->hash_algo, "sha256"))
-		die("Unknown git hash algorithm in gpgsig: '%s'", sig->hash_algo);
+		die(_("unknown git hash algorithm in gpgsig: '%s'"), sig->hash_algo);
 
 	/* Validate signature format */
 	if (!valid_signature_format(sig->sig_format))
-		die("Invalid signature format in gpgsig: '%s'", sig->sig_format);
+		die(_("invalid signature format in gpgsig: '%s'"), sig->sig_format);
 	if (!strcmp(sig->sig_format, "unknown"))
-		warning("'unknown' signature format in gpgsig");
+		warning(_("'unknown' signature format in gpgsig"));
 
 	/* Read signature data */
-	read_next_command();
+	read_next_command(state);
 	parse_data(&sig->data, 0, NULL);
+}
+
+static void discard_one_signature(struct fast_import_state *state)
+{
+	struct strbuf data = STRBUF_INIT;
+
+	read_next_command(state);
+	parse_data(&data, 0, NULL);
+	strbuf_release(&data);
 }
 
 static void add_gpgsig_to_commit(struct strbuf *commit_data,
@@ -2758,7 +2832,7 @@ static void add_gpgsig_to_commit(struct strbuf *commit_data,
 {
 	struct string_list siglines = STRING_LIST_INIT_NODUP;
 
-	if (!sig->hash_algo)
+	if (!sig || !sig->hash_algo)
 		return;
 
 	strbuf_addstr(commit_data, header);
@@ -2775,8 +2849,8 @@ static void store_signature(struct signature_data *stored_sig,
 			    const char *hash_type)
 {
 	if (stored_sig->hash_algo) {
-		warning("multiple %s signatures found, "
-			"ignoring additional signature",
+		warning(_("multiple %s signatures found, "
+			  "ignoring additional signature"),
 			hash_type);
 		strbuf_release(&new_sig->data);
 		free(new_sig->hash_algo);
@@ -2785,7 +2859,128 @@ static void store_signature(struct signature_data *stored_sig,
 	}
 }
 
-static void parse_new_commit(const char *arg)
+static void import_one_signature(struct fast_import_state *state,
+				 struct signature_data *sig_sha1,
+				 struct signature_data *sig_sha256,
+				 const char *v)
+{
+	struct signature_data sig = { NULL, NULL, STRBUF_INIT };
+
+	parse_one_signature(state, &sig, v);
+
+	if (!strcmp(sig.hash_algo, "sha1"))
+		store_signature(sig_sha1, &sig, "SHA-1");
+	else if (!strcmp(sig.hash_algo, "sha256"))
+		store_signature(sig_sha256, &sig, "SHA-256");
+	else
+		die(_("parse_one_signature() returned unknown hash algo"));
+}
+
+static void finalize_commit_buffer(struct strbuf *new_data,
+				   struct signature_data *sig_sha1,
+				   struct signature_data *sig_sha256,
+				   struct strbuf *msg)
+{
+	add_gpgsig_to_commit(new_data, "gpgsig ", sig_sha1);
+	add_gpgsig_to_commit(new_data, "gpgsig-sha256 ", sig_sha256);
+
+	strbuf_addch(new_data, '\n');
+	strbuf_addbuf(new_data, msg);
+}
+
+static void warn_invalid_signature(struct signature_check *check,
+				   const char *msg, enum sign_mode mode)
+{
+	const char *signer = check->signer ? check->signer : _("unknown");
+	const char *subject;
+	int subject_len = find_commit_subject(msg, &subject);
+
+	switch (mode) {
+	case SIGN_STRIP_IF_INVALID:
+		if (subject_len > 100)
+			warning(_("stripping invalid signature for commit '%.100s...'\n"
+				  "  allegedly by %s"), subject, signer);
+		else if (subject_len > 0)
+			warning(_("stripping invalid signature for commit '%.*s'\n"
+				  "  allegedly by %s"), subject_len, subject, signer);
+		else
+			warning(_("stripping invalid signature for commit\n"
+				  "  allegedly by %s"), signer);
+		break;
+	case SIGN_SIGN_IF_INVALID:
+		if (subject_len > 100)
+			warning(_("replacing invalid signature for commit '%.100s...'\n"
+				  "  allegedly by %s"), subject, signer);
+		else if (subject_len > 0)
+			warning(_("replacing invalid signature for commit '%.*s'\n"
+				  "  allegedly by %s"), subject_len, subject, signer);
+		else
+			warning(_("replacing invalid signature for commit\n"
+				  "  allegedly by %s"), signer);
+		break;
+	default:
+		BUG("unsupported signing mode");
+	}
+}
+
+static void handle_signature_if_invalid(struct strbuf *new_data,
+					struct signature_data *sig_sha1,
+					struct signature_data *sig_sha256,
+					struct strbuf *msg,
+					enum sign_mode mode)
+{
+	struct strbuf tmp_buf = STRBUF_INIT;
+	struct signature_check signature_check = { 0 };
+	int ret;
+
+	/* Check signature in a temporary commit buffer */
+	strbuf_addbuf(&tmp_buf, new_data);
+	finalize_commit_buffer(&tmp_buf, sig_sha1, sig_sha256, msg);
+	ret = verify_commit_buffer(tmp_buf.buf, tmp_buf.len, &signature_check);
+
+	if (ret) {
+		if (mode == SIGN_ABORT_IF_INVALID)
+			die(_("aborting due to invalid signature"));
+
+		warn_invalid_signature(&signature_check, msg->buf, mode);
+
+		if (mode == SIGN_SIGN_IF_INVALID) {
+			struct strbuf signature = STRBUF_INIT;
+			struct strbuf payload = STRBUF_INIT;
+
+			/*
+			 * NEEDSWORK: To properly support interoperability mode
+			 * when signing commit signatures, the commit buffer
+			 * must be provided in both the repository and
+			 * compatibility object formats. As currently
+			 * implemented, only the repository object format is
+			 * considered meaning compatibility signatures cannot be
+			 * generated. Thus, attempting to sign commit signatures
+			 * in interoperability mode is currently unsupported.
+			 */
+			if (the_repository->compat_hash_algo)
+				die(_("signing commits in interoperability mode is unsupported"));
+
+			strbuf_addstr(&payload, signature_check.payload);
+			if (sign_buffer(&payload, &signature, signed_commit_keyid,
+					SIGN_BUFFER_USE_DEFAULT_KEY))
+				die(_("failed to sign commit object"));
+			add_header_signature(new_data, &signature, the_hash_algo);
+
+			strbuf_release(&signature);
+			strbuf_release(&payload);
+		}
+
+		finalize_commit_buffer(new_data, NULL, NULL, msg);
+	} else {
+		strbuf_swap(new_data, &tmp_buf);
+	}
+
+	signature_check_clear(&signature_check);
+	strbuf_release(&tmp_buf);
+}
+
+static void parse_new_commit(struct fast_import_state *state, const char *arg)
 {
 	static struct strbuf msg = STRBUF_INIT;
 	struct signature_data sig_sha1 = { NULL, NULL, STRBUF_INIT };
@@ -2803,44 +2998,60 @@ static void parse_new_commit(const char *arg)
 	if (!b)
 		b = new_branch(arg);
 
-	read_next_command();
-	parse_mark();
-	parse_original_identifier();
+	read_next_command(state);
+	parse_mark(state);
+	parse_original_identifier(state);
 	if (skip_prefix(command_buf.buf, "author ", &v)) {
 		author = parse_ident(v);
-		read_next_command();
+		read_next_command(state);
 	}
 	if (skip_prefix(command_buf.buf, "committer ", &v)) {
 		committer = parse_ident(v);
-		read_next_command();
+		read_next_command(state);
 	}
 	if (!committer)
-		die("Expected committer but didn't get one");
+		die(_("expected committer but didn't get one"));
 
-	/* Process signatures (up to 2: one "sha1" and one "sha256") */
 	while (skip_prefix(command_buf.buf, "gpgsig ", &v)) {
-		struct signature_data sig = { NULL, NULL, STRBUF_INIT };
+		switch (signed_commit_mode) {
 
-		parse_one_signature(&sig, v);
+		/* First, modes that don't need the signature to be parsed */
+		case SIGN_ABORT:
+			die(_("encountered signed commit; use "
+			      "--signed-commits=<mode> to handle it"));
+		case SIGN_WARN_STRIP:
+			warning(_("stripping a commit signature"));
+			/* fallthru */
+		case SIGN_STRIP:
+			discard_one_signature(state);
+			break;
 
-		if (!strcmp(sig.hash_algo, "sha1"))
-			store_signature(&sig_sha1, &sig, "SHA-1");
-		else if (!strcmp(sig.hash_algo, "sha256"))
-			store_signature(&sig_sha256, &sig, "SHA-256");
-		else
-			BUG("parse_one_signature() returned unknown hash algo");
+		/* Second, modes that parse the signature */
+		case SIGN_WARN_VERBATIM:
+			warning(_("importing a commit signature verbatim"));
+			/* fallthru */
+		case SIGN_VERBATIM:
+		case SIGN_STRIP_IF_INVALID:
+		case SIGN_SIGN_IF_INVALID:
+		case SIGN_ABORT_IF_INVALID:
+			import_one_signature(state, &sig_sha1, &sig_sha256, v);
+			break;
 
-		read_next_command();
+		/* Third, BUG */
+		default:
+			BUG("invalid signed_commit_mode value %d", signed_commit_mode);
+		}
+		read_next_command(state);
 	}
 
 	if (skip_prefix(command_buf.buf, "encoding ", &v)) {
 		encoding = xstrdup(v);
-		read_next_command();
+		read_next_command(state);
 	}
 	parse_data(&msg, 0, NULL);
-	read_next_command();
-	parse_from(b);
-	merge_list = parse_merge(&merge_count);
+	read_next_command(state);
+	parse_from(state, b);
+	merge_list = parse_merge(state, &merge_count);
 
 	/* ensure the branch is active/loaded */
 	if (!b->branch_tree.tree || !max_active_branches) {
@@ -2853,7 +3064,7 @@ static void parse_new_commit(const char *arg)
 	/* file_change* */
 	while (command_buf.len > 0) {
 		if (skip_prefix(command_buf.buf, "M ", &v))
-			file_change_m(v, b);
+			file_change_m(state, v, b);
 		else if (skip_prefix(command_buf.buf, "D ", &v))
 			file_change_d(v, b);
 		else if (skip_prefix(command_buf.buf, "R ", &v))
@@ -2861,18 +3072,18 @@ static void parse_new_commit(const char *arg)
 		else if (skip_prefix(command_buf.buf, "C ", &v))
 			file_change_cr(v, b, 0);
 		else if (skip_prefix(command_buf.buf, "N ", &v))
-			note_change_n(v, b, &prev_fanout);
+			note_change_n(state, v, b, &prev_fanout);
 		else if (!strcmp("deleteall", command_buf.buf))
 			file_change_deleteall(b);
 		else if (skip_prefix(command_buf.buf, "ls ", &v))
-			parse_ls(v, b);
+			parse_ls(state, v, b);
 		else if (skip_prefix(command_buf.buf, "cat-blob ", &v))
-			parse_cat_blob(v);
+			parse_cat_blob(state, v);
 		else {
 			unread_command_buf = 1;
 			break;
 		}
-		if (read_next_command() == EOF)
+		if (read_next_command(state) == EOF)
 			break;
 	}
 
@@ -2907,11 +3118,15 @@ static void parse_new_commit(const char *arg)
 			"encoding %s\n",
 			encoding);
 
-	add_gpgsig_to_commit(&new_data, "gpgsig ", &sig_sha1);
-	add_gpgsig_to_commit(&new_data, "gpgsig-sha256 ", &sig_sha256);
+	if ((signed_commit_mode == SIGN_STRIP_IF_INVALID ||
+	     signed_commit_mode == SIGN_SIGN_IF_INVALID ||
+	     signed_commit_mode == SIGN_ABORT_IF_INVALID) &&
+	    (sig_sha1.hash_algo || sig_sha256.hash_algo))
+		handle_signature_if_invalid(&new_data, &sig_sha1, &sig_sha256,
+					    &msg, signed_commit_mode);
+	else
+		finalize_commit_buffer(&new_data, &sig_sha1, &sig_sha256, &msg);
 
-	strbuf_addch(&new_data, '\n');
-	strbuf_addbuf(&new_data, &msg);
 	free(author);
 	free(committer);
 	free(encoding);
@@ -2921,7 +3136,92 @@ static void parse_new_commit(const char *arg)
 	b->last_commit = object_count_by_type[OBJ_COMMIT];
 }
 
-static void parse_new_tag(const char *arg)
+static void handle_tag_signature_if_invalid(struct strbuf *buf,
+					    struct strbuf *msg,
+					    size_t sig_offset)
+{
+	struct strbuf signature = STRBUF_INIT;
+	struct strbuf payload = STRBUF_INIT;
+	struct signature_check sigc = { 0 };
+
+	strbuf_addbuf(&payload, buf);
+	strbuf_addch(&payload, '\n');
+	strbuf_add(&payload, msg->buf, sig_offset);
+	strbuf_add(&signature, msg->buf + sig_offset, msg->len - sig_offset);
+
+	sigc.payload_type = SIGNATURE_PAYLOAD_TAG;
+	sigc.payload = strbuf_detach(&payload, &sigc.payload_len);
+
+	if (!check_signature(&sigc, signature.buf, signature.len))
+		goto out;
+
+	if (signed_tag_mode == SIGN_ABORT_IF_INVALID)
+		die(_("aborting due to invalid signature"));
+
+	strbuf_setlen(msg, sig_offset);
+
+	if (signed_tag_mode == SIGN_SIGN_IF_INVALID) {
+		strbuf_attach(&payload, sigc.payload, sigc.payload_len,
+			      sigc.payload_len + 1);
+		sigc.payload = NULL;
+		strbuf_reset(&signature);
+
+		if (sign_buffer(&payload, &signature, signed_tag_keyid,
+				SIGN_BUFFER_USE_DEFAULT_KEY))
+			die(_("failed to sign tag object"));
+
+		strbuf_addbuf(msg, &signature);
+	}
+
+out:
+	signature_check_clear(&sigc);
+	strbuf_release(&signature);
+	strbuf_release(&payload);
+}
+
+static void handle_tag_signature(struct strbuf *buf, struct strbuf *msg, const char *name)
+{
+	size_t sig_offset = parse_signed_buffer(msg->buf, msg->len);
+
+	/* If there is no signature, there is nothing to do. */
+	if (sig_offset >= msg->len)
+		return;
+
+	switch (signed_tag_mode) {
+
+	/* First, modes that don't change anything */
+	case SIGN_WARN_VERBATIM:
+		warning(_("importing a tag signature verbatim for tag '%s'"), name);
+		/* fallthru */
+	case SIGN_VERBATIM:
+		/* Nothing to do, the signature will be put into the imported tag. */
+		break;
+
+	/* Second, modes that remove the signature */
+	case SIGN_WARN_STRIP:
+		warning(_("stripping a tag signature for tag '%s'"), name);
+		/* fallthru */
+	case SIGN_STRIP:
+		/* Truncate the buffer to remove the signature */
+		strbuf_setlen(msg, sig_offset);
+		break;
+	case SIGN_ABORT_IF_INVALID:
+	case SIGN_SIGN_IF_INVALID:
+	case SIGN_STRIP_IF_INVALID:
+		handle_tag_signature_if_invalid(buf, msg, sig_offset);
+		break;
+
+	/* Third, aborting modes */
+	case SIGN_ABORT:
+		die(_("encountered signed tag; use "
+		      "--signed-tags=<mode> to handle it"));
+	default:
+		BUG("invalid signed_tag_mode value %d from tag '%s'",
+		    signed_tag_mode, name);
+	}
+}
+
+static void parse_new_tag(struct fast_import_state *state, const char *arg)
 {
 	static struct strbuf msg = STRBUF_INIT;
 	const char *from;
@@ -2940,16 +3240,16 @@ static void parse_new_tag(const char *arg)
 	else
 		first_tag = t;
 	last_tag = t;
-	read_next_command();
-	parse_mark();
+	read_next_command(state);
+	parse_mark(state);
 
 	/* from ... */
 	if (!skip_prefix(command_buf.buf, "from ", &from))
-		die("Expected from command, got %s", command_buf.buf);
+		die(_("expected 'from' command, got '%s'"), command_buf.buf);
 	s = lookup_branch(from);
 	if (s) {
 		if (is_null_oid(&s->oid))
-			die("Can't tag an empty branch.");
+			die(_("can't tag an empty branch."));
 		oidcpy(&oid, &s->oid);
 		type = OBJ_COMMIT;
 	} else if (*from == ':') {
@@ -2964,20 +3264,20 @@ static void parse_new_tag(const char *arg)
 			type = odb_read_object_info(the_repository->objects,
 						    &oid, NULL);
 			if (type < 0)
-				die("Not a valid object: %s", from);
+				die(_("not a valid object: %s"), from);
 		} else
 			type = oe->type;
 	} else
-		die("Invalid ref name or SHA1 expression: %s", from);
-	read_next_command();
+		die(_("invalid ref name or SHA1 expression: %s"), from);
+	read_next_command(state);
 
 	/* original-oid ... */
-	parse_original_identifier();
+	parse_original_identifier(state);
 
 	/* tagger ... */
 	if (skip_prefix(command_buf.buf, "tagger ", &v)) {
 		tagger = parse_ident(v);
-		read_next_command();
+		read_next_command(state);
 	} else
 		tagger = NULL;
 
@@ -2995,6 +3295,9 @@ static void parse_new_tag(const char *arg)
 	if (tagger)
 		strbuf_addf(&new_data,
 			    "tagger %s\n", tagger);
+
+	handle_tag_signature(&new_data, &msg, t->name);
+
 	strbuf_addch(&new_data, '\n');
 	strbuf_addbuf(&new_data, &msg);
 	free(tagger);
@@ -3005,7 +3308,7 @@ static void parse_new_tag(const char *arg)
 		t->pack_id = pack_id;
 }
 
-static void parse_reset_branch(const char *arg)
+static void parse_reset_branch(struct fast_import_state *state, const char *arg)
 {
 	struct branch *b;
 	const char *tag_name;
@@ -3022,8 +3325,8 @@ static void parse_reset_branch(const char *arg)
 	}
 	else
 		b = new_branch(arg);
-	read_next_command();
-	parse_from(b);
+	read_next_command(state);
+	parse_from(state, b);
 	if (b->delete && skip_prefix(b->name, "refs/tags/", &tag_name)) {
 		/*
 		 * Elsewhere, we call dump_branches() before dump_tags(),
@@ -3057,18 +3360,22 @@ static void parse_reset_branch(const char *arg)
 static void cat_blob_write(const char *buf, unsigned long size)
 {
 	if (write_in_full(cat_blob_fd, buf, size) < 0)
-		die_errno("Write to frontend failed");
+		die_errno(_("write to frontend failed"));
 }
 
 static void cat_blob(struct object_entry *oe, struct object_id *oid)
 {
 	struct strbuf line = STRBUF_INIT;
+	struct iovec iov[3];
 	unsigned long size;
 	enum object_type type = 0;
 	char *buf;
 
 	if (!oe || oe->pack_id == MAX_PACK_ID) {
-		buf = odb_read_object(the_repository->objects, oid, &type, &size);
+		size_t size_st = 0;
+		buf = odb_read_object(the_repository->objects, oid, &type,
+				      &size_st);
+		size = cast_size_t_to_ulong(size_st);
 	} else {
 		type = oe->type;
 		buf = gfi_unpack_entry(oe, &size);
@@ -3086,43 +3393,56 @@ static void cat_blob(struct object_entry *oe, struct object_id *oid)
 		return;
 	}
 	if (!buf)
-		die("Can't read object %s", oid_to_hex(oid));
+		die(_("can't read object %s"), oid_to_hex(oid));
 	if (type != OBJ_BLOB)
-		die("Object %s is a %s but a blob was expected.",
+		die(_("object %s is a %s but a blob was expected."),
 		    oid_to_hex(oid), type_name(type));
 	strbuf_reset(&line);
 	strbuf_addf(&line, "%s %s %"PRIuMAX"\n", oid_to_hex(oid),
 		    type_name(type), (uintmax_t)size);
-	cat_blob_write(line.buf, line.len);
+
+	/*
+	 * Write the header, the payload and the trailing newline with a
+	 * single writev(3p) call instead of three separate write(3p) calls.
+	 */
+	iov[0].iov_base = line.buf;
+	iov[0].iov_len = line.len;
+	iov[1].iov_base = buf;
+	iov[1].iov_len = size;
+	iov[2].iov_base = (void *) "\n";
+	iov[2].iov_len = 1;
+
+	if (writev_in_full(cat_blob_fd, iov, ARRAY_SIZE(iov)) < 0)
+		die_errno(_("write to frontend failed"));
 	strbuf_release(&line);
-	cat_blob_write(buf, size);
-	cat_blob_write("\n", 1);
 	if (oe && oe->pack_id == pack_id) {
 		last_blob.offset = oe->idx.offset;
-		strbuf_attach(&last_blob.data, buf, size, size);
+		strbuf_attach(&last_blob.data, buf, size, size + 1);
 		last_blob.depth = oe->depth;
 	} else
 		free(buf);
 }
 
-static void parse_get_mark(const char *p)
+static void parse_get_mark(struct fast_import_state *state UNUSED,
+			   const char *p)
 {
 	struct object_entry *oe;
 	char output[GIT_MAX_HEXSZ + 2];
 
 	/* get-mark SP <object> LF */
 	if (*p != ':')
-		die("Not a mark: %s", p);
+		die(_("not a mark: %s"), p);
 
 	oe = find_mark(marks, parse_mark_ref_eol(p));
 	if (!oe)
-		die("Unknown mark: %s", command_buf.buf);
+		die(_("unknown mark: %s"), command_buf.buf);
 
 	xsnprintf(output, sizeof(output), "%s\n", oid_to_hex(&oe->idx.oid));
 	cat_blob_write(output, the_hash_algo->hexsz + 1);
 }
 
-static void parse_cat_blob(const char *p)
+static void parse_cat_blob(struct fast_import_state *state UNUSED,
+			   const char *p)
 {
 	struct object_entry *oe;
 	struct object_id oid;
@@ -3131,13 +3451,13 @@ static void parse_cat_blob(const char *p)
 	if (*p == ':') {
 		oe = find_mark(marks, parse_mark_ref_eol(p));
 		if (!oe)
-			die("Unknown mark: %s", command_buf.buf);
+			die(_("unknown mark: %s"), command_buf.buf);
 		oidcpy(&oid, &oe->idx.oid);
 	} else {
 		if (parse_mapped_oid_hex(p, &oid, &p))
-			die("Invalid dataref: %s", command_buf.buf);
+			die(_("invalid dataref: %s"), command_buf.buf);
 		if (*p)
-			die("Garbage after SHA1: %s", command_buf.buf);
+			die(_("garbage after SHA1: %s"), command_buf.buf);
 		oe = find_object(&oid);
 	}
 
@@ -3155,7 +3475,7 @@ static struct object_entry *dereference(struct object_entry *oe,
 		enum object_type type = odb_read_object_info(the_repository->objects,
 							     oid, NULL);
 		if (type < 0)
-			die("object not found: %s", oid_to_hex(oid));
+			die(_("object not found: %s"), oid_to_hex(oid));
 		/* cache it! */
 		oe = insert_object(oid);
 		oe->type = type;
@@ -3169,30 +3489,32 @@ static struct object_entry *dereference(struct object_entry *oe,
 	case OBJ_TAG:
 		break;
 	default:
-		die("Not a tree-ish: %s", command_buf.buf);
+		die(_("not a tree-ish: %s"), command_buf.buf);
 	}
 
 	if (oe->pack_id != MAX_PACK_ID) {	/* in a pack being written */
 		buf = gfi_unpack_entry(oe, &size);
 	} else {
 		enum object_type unused;
+		size_t size_st = 0;
 		buf = odb_read_object(the_repository->objects, oid,
-				      &unused, &size);
+				      &unused, &size_st);
+		size = cast_size_t_to_ulong(size_st);
 	}
 	if (!buf)
-		die("Can't load object %s", oid_to_hex(oid));
+		die(_("can't load object %s"), oid_to_hex(oid));
 
 	/* Peel one layer. */
 	switch (oe->type) {
 	case OBJ_TAG:
 		if (size < hexsz + strlen("object ") ||
 		    get_oid_hex(buf + strlen("object "), oid))
-			die("Invalid SHA1 in tag: %s", command_buf.buf);
+			die(_("invalid SHA1 in tag: %s"), command_buf.buf);
 		break;
 	case OBJ_COMMIT:
 		if (size < hexsz + strlen("tree ") ||
 		    get_oid_hex(buf + strlen("tree "), oid))
-			die("Invalid SHA1 in commit: %s", command_buf.buf);
+			die(_("invalid SHA1 in commit: %s"), command_buf.buf);
 	}
 
 	free(buf);
@@ -3227,9 +3549,9 @@ static void build_mark_map(struct string_list *from, struct string_list *to)
 	for_each_string_list_item(fromp, from) {
 		top = string_list_lookup(to, fromp->string);
 		if (!fromp->util) {
-			die(_("Missing from marks for submodule '%s'"), fromp->string);
+			die(_("missing from marks for submodule '%s'"), fromp->string);
 		} else if (!top || !top->util) {
-			die(_("Missing to marks for submodule '%s'"), fromp->string);
+			die(_("missing to marks for submodule '%s'"), fromp->string);
 		}
 		build_mark_map_one(fromp->util, top->util);
 	}
@@ -3243,14 +3565,14 @@ static struct object_entry *parse_treeish_dataref(const char **p)
 	if (**p == ':') {	/* <mark> */
 		e = find_mark(marks, parse_mark_ref_space(p));
 		if (!e)
-			die("Unknown mark: %s", command_buf.buf);
+			die(_("unknown mark: %s"), command_buf.buf);
 		oidcpy(&oid, &e->idx.oid);
 	} else {	/* <sha1> */
 		if (parse_mapped_oid_hex(*p, &oid, p))
-			die("Invalid dataref: %s", command_buf.buf);
+			die(_("invalid dataref: %s"), command_buf.buf);
 		e = find_object(&oid);
 		if (*(*p)++ != ' ')
-			die("Missing space after tree-ish: %s", command_buf.buf);
+			die(_("missing space after tree-ish: %s"), command_buf.buf);
 	}
 
 	while (!e || e->type != OBJ_TREE)
@@ -3285,7 +3607,9 @@ static void print_ls(int mode, const unsigned char *hash, const char *path)
 	cat_blob_write(line.buf, line.len);
 }
 
-static void parse_ls(const char *p, struct branch *b)
+static void parse_ls(struct fast_import_state *state UNUSED,
+		     const char *p,
+		     struct branch *b)
 {
 	static struct strbuf path = STRBUF_INIT;
 	struct tree_entry *root = NULL;
@@ -3294,7 +3618,7 @@ static void parse_ls(const char *p, struct branch *b)
 	/* ls SP (<tree-ish> SP)? <path> */
 	if (*p == '"') {
 		if (!b)
-			die("Not in a commit: %s", command_buf.buf);
+			die(_("not in a commit: %s"), command_buf.buf);
 		root = &b->branch_tree;
 	} else {
 		struct object_entry *e = parse_treeish_dataref(&p);
@@ -3332,13 +3656,13 @@ static void checkpoint(void)
 	dump_marks();
 }
 
-static void parse_checkpoint(void)
+static void parse_checkpoint(struct fast_import_state *state UNUSED)
 {
 	checkpoint_requested = 1;
 	skip_optional_lf();
 }
 
-static void parse_progress(void)
+static void parse_progress(struct fast_import_state *state UNUSED)
 {
 	fwrite(command_buf.buf, 1, command_buf.len, stdout);
 	fputc('\n', stdout);
@@ -3346,41 +3670,44 @@ static void parse_progress(void)
 	skip_optional_lf();
 }
 
-static void parse_alias(void)
+static void parse_alias(struct fast_import_state *state)
 {
 	struct object_entry *e;
 	struct branch b;
 
 	skip_optional_lf();
-	read_next_command();
+	read_next_command(state);
 
 	/* mark ... */
-	parse_mark();
+	parse_mark(state);
 	if (!next_mark)
-		die(_("Expected 'mark' command, got %s"), command_buf.buf);
+		die(_("expected 'mark' command, got %s"), command_buf.buf);
 
 	/* to ... */
 	memset(&b, 0, sizeof(b));
-	if (!parse_objectish_with_prefix(&b, "to "))
-		die(_("Expected 'to' command, got %s"), command_buf.buf);
+	if (!parse_objectish_with_prefix(state, &b, "to "))
+		die(_("expected 'to' command, got %s"), command_buf.buf);
 	e = find_object(&b.oid);
 	assert(e);
 	insert_mark(&marks, next_mark, e);
 }
 
-static char* make_fast_import_path(const char *path)
+static char* make_fast_import_path(struct fast_import_state *state,
+				   const char *path)
 {
 	if (!relative_marks_paths || is_absolute_path(path))
-		return prefix_filename(global_prefix, path);
+		return prefix_filename(state->prefix, path);
 	return repo_git_path(the_repository, "info/fast-import/%s", path);
 }
 
-static void option_import_marks(const char *marks,
-					int from_stream, int ignore_missing)
+static void option_import_marks(struct fast_import_state *state,
+				const char *marks,
+				int from_stream,
+				int ignore_missing)
 {
 	if (import_marks_file) {
 		if (from_stream)
-			die("Only one import-marks command allowed per stream");
+			die(_("only one import-marks command allowed per stream"));
 
 		/* read previous mark file */
 		if(!import_marks_file_from_stream)
@@ -3388,7 +3715,7 @@ static void option_import_marks(const char *marks,
 	}
 
 	free(import_marks_file);
-	import_marks_file = make_fast_import_path(marks);
+	import_marks_file = make_fast_import_path(state, marks);
 	import_marks_file_from_stream = from_stream;
 	import_marks_file_ignore_missing = ignore_missing;
 }
@@ -3404,7 +3731,7 @@ static void option_date_format(const char *fmt)
 	else if (!strcmp(fmt, "now"))
 		whenspec = WHENSPEC_NOW;
 	else
-		die("unknown --date-format argument %s", fmt);
+		die(_("unknown --date-format argument %s"), fmt);
 }
 
 static unsigned long ulong_arg(const char *option, const char *arg)
@@ -3412,7 +3739,7 @@ static unsigned long ulong_arg(const char *option, const char *arg)
 	char *endptr;
 	unsigned long rv = strtoul(arg, &endptr, 0);
 	if (strchr(arg, '-') || endptr == arg || *endptr)
-		die("%s: argument must be a non-negative integer", option);
+		die(_("%s: argument must be a non-negative integer"), option);
 	return rv;
 }
 
@@ -3420,7 +3747,7 @@ static void option_depth(const char *depth)
 {
 	max_depth = ulong_arg("--depth", depth);
 	if (max_depth > MAX_DEPTH)
-		die("--depth cannot exceed %u", MAX_DEPTH);
+		die(_("--depth cannot exceed %u"), MAX_DEPTH);
 }
 
 static void option_active_branches(const char *branches)
@@ -3428,45 +3755,50 @@ static void option_active_branches(const char *branches)
 	max_active_branches = ulong_arg("--active-branches", branches);
 }
 
-static void option_export_marks(const char *marks)
+static void option_export_marks(struct fast_import_state *state,
+				const char *marks)
 {
 	free(export_marks_file);
-	export_marks_file = make_fast_import_path(marks);
+	export_marks_file = make_fast_import_path(state, marks);
 }
 
-static void option_cat_blob_fd(const char *fd)
+static void option_cat_blob_fd(struct fast_import_state *state UNUSED,
+			       const char *fd)
 {
 	unsigned long n = ulong_arg("--cat-blob-fd", fd);
 	if (n > (unsigned long) INT_MAX)
-		die("--cat-blob-fd cannot exceed %d", INT_MAX);
+		die(_("--cat-blob-fd cannot exceed %d"), INT_MAX);
 	cat_blob_fd = (int) n;
 }
 
-static void option_export_pack_edges(const char *edges)
+static void option_export_pack_edges(struct fast_import_state *state,
+				     const char *edges)
 {
-	char *fn = prefix_filename(global_prefix, edges);
+	char *fn = prefix_filename(state->prefix, edges);
 	if (pack_edges)
 		fclose(pack_edges);
 	pack_edges = xfopen(fn, "a");
 	free(fn);
 }
 
-static void option_rewrite_submodules(const char *arg, struct string_list *list)
+static void option_rewrite_submodules(struct fast_import_state *state,
+				      const char *arg,
+				      struct string_list *list)
 {
 	struct mark_set *ms;
 	FILE *fp;
 	char *s = xstrdup(arg);
 	char *f = strchr(s, ':');
 	if (!f)
-		die(_("Expected format name:filename for submodule rewrite option"));
+		die(_("expected format name:filename for submodule rewrite option"));
 	*f = '\0';
 	f++;
 	CALLOC_ARRAY(ms, 1);
 
-	f = prefix_filename(global_prefix, f);
+	f = prefix_filename(state->prefix, f);
 	fp = fopen(f, "r");
 	if (!fp)
-		die_errno("cannot read '%s'", f);
+		die_errno(_("cannot read '%s'"), f);
 	read_mark_file(&ms, fp, insert_oid_entry);
 	fclose(fp);
 	free(f);
@@ -3476,34 +3808,67 @@ static void option_rewrite_submodules(const char *arg, struct string_list *list)
 	free(s);
 }
 
-static int parse_one_option(const char *option)
+static void option_max_pack_size(const char *arg)
+{
+	unsigned long v;
+
+	if (!git_parse_ulong(arg, &v))
+		die(_("--max-pack-size: argument must be a non-negative integer"));
+	if (v < 8192) {
+		warning(_("max-pack-size is now in bytes, assuming --max-pack-size=%lum"), v);
+		v *= 1024 * 1024;
+	} else if (v < 1024 * 1024) {
+		warning(_("minimum max-pack-size is 1 MiB"));
+		v = 1024 * 1024;
+	}
+	max_packsize = v;
+}
+
+static void option_big_file_threshold(const char *arg)
+{
+	unsigned long v;
+
+	if (!git_parse_ulong(arg, &v))
+		die(_("--big-file-threshold: argument must be a non-negative integer"));
+	repo_settings_set_big_file_threshold(the_repository, v);
+}
+
+static void option_signed_commits(const char *arg)
+{
+	if (parse_sign_mode(arg, &signed_commit_mode, &signed_commit_keyid))
+		usagef(_("unknown --signed-commits mode '%s'"), arg);
+}
+
+static void option_signed_tags(const char *arg)
+{
+	if (parse_sign_mode(arg, &signed_tag_mode, &signed_tag_keyid))
+		usagef(_("unknown --signed-tags mode '%s'"), arg);
+}
+
+static void option_quiet(void)
+{
+	show_stats = 0;
+	quiet = 1;
+}
+
+static int parse_one_option(struct fast_import_state *state, const char *option)
 {
 	if (skip_prefix(option, "max-pack-size=", &option)) {
-		unsigned long v;
-		if (!git_parse_ulong(option, &v))
-			return 0;
-		if (v < 8192) {
-			warning("max-pack-size is now in bytes, assuming --max-pack-size=%lum", v);
-			v *= 1024 * 1024;
-		} else if (v < 1024 * 1024) {
-			warning("minimum max-pack-size is 1 MiB");
-			v = 1024 * 1024;
-		}
-		max_packsize = v;
+		option_max_pack_size(option);
 	} else if (skip_prefix(option, "big-file-threshold=", &option)) {
-		unsigned long v;
-		if (!git_parse_ulong(option, &v))
-			return 0;
-		repo_settings_set_big_file_threshold(the_repository, v);
+		option_big_file_threshold(option);
 	} else if (skip_prefix(option, "depth=", &option)) {
 		option_depth(option);
 	} else if (skip_prefix(option, "active-branches=", &option)) {
 		option_active_branches(option);
 	} else if (skip_prefix(option, "export-pack-edges=", &option)) {
-		option_export_pack_edges(option);
+		option_export_pack_edges(state, option);
+	} else if (skip_prefix(option, "signed-commits=", &option)) {
+		option_signed_commits(option);
+	} else if (skip_prefix(option, "signed-tags=", &option)) {
+		option_signed_tags(option);
 	} else if (!strcmp(option, "quiet")) {
-		show_stats = 0;
-		quiet = 1;
+		option_quiet();
 	} else if (!strcmp(option, "stats")) {
 		show_stats = 1;
 	} else if (!strcmp(option, "allow-unsafe-features")) {
@@ -3515,34 +3880,36 @@ static int parse_one_option(const char *option)
 	return 1;
 }
 
-static void check_unsafe_feature(const char *feature, int from_stream)
+static void check_unsafe_feature(struct fast_import_state *state,
+				 const char *feature)
 {
-	if (from_stream && !allow_unsafe_features)
+	if (!state->allow_unsafe_features)
 		die(_("feature '%s' forbidden in input without --allow-unsafe-features"),
 		    feature);
 }
 
-static int parse_one_feature(const char *feature, int from_stream)
+static int parse_one_feature(struct fast_import_state *state,
+			     const char *feature)
 {
 	const char *arg;
 
 	if (skip_prefix(feature, "date-format=", &arg)) {
 		option_date_format(arg);
 	} else if (skip_prefix(feature, "import-marks=", &arg)) {
-		check_unsafe_feature("import-marks", from_stream);
-		option_import_marks(arg, from_stream, 0);
+		check_unsafe_feature(state, "import-marks");
+		option_import_marks(state, arg, 1, 0);
 	} else if (skip_prefix(feature, "import-marks-if-exists=", &arg)) {
-		check_unsafe_feature("import-marks-if-exists", from_stream);
-		option_import_marks(arg, from_stream, 1);
+		check_unsafe_feature(state, "import-marks-if-exists");
+		option_import_marks(state, arg, 1, 1);
 	} else if (skip_prefix(feature, "export-marks=", &arg)) {
-		check_unsafe_feature(feature, from_stream);
-		option_export_marks(arg);
+		check_unsafe_feature(state, feature);
+		option_export_marks(state, arg);
 	} else if (!strcmp(feature, "alias")) {
 		; /* Don't die - this feature is supported */
 	} else if (skip_prefix(feature, "rewrite-submodules-to=", &arg)) {
-		option_rewrite_submodules(arg, &sub_marks_to);
+		option_rewrite_submodules(state, arg, &sub_marks_to);
 	} else if (skip_prefix(feature, "rewrite-submodules-from=", &arg)) {
-		option_rewrite_submodules(arg, &sub_marks_from);
+		option_rewrite_submodules(state, arg, &sub_marks_from);
 	} else if (!strcmp(feature, "get-mark")) {
 		; /* Don't die - this feature is supported */
 	} else if (!strcmp(feature, "cat-blob")) {
@@ -3564,26 +3931,26 @@ static int parse_one_feature(const char *feature, int from_stream)
 	return 1;
 }
 
-static void parse_feature(const char *feature)
+static void parse_feature(struct fast_import_state *state, const char *feature)
 {
-	if (seen_data_command)
-		die("Got feature command '%s' after data command", feature);
+	if (state->seen_data_command)
+		die(_("got feature command '%s' after data command"), feature);
 
-	if (parse_one_feature(feature, 1))
+	if (parse_one_feature(state, feature))
 		return;
 
-	die("This version of fast-import does not support feature %s.", feature);
+	die(_("this version of fast-import does not support feature %s."), feature);
 }
 
-static void parse_option(const char *option)
+static void parse_option(struct fast_import_state *state, const char *option)
 {
-	if (seen_data_command)
-		die("Got option command '%s' after data command", option);
+	if (state->seen_data_command)
+		die(_("got option command '%s' after data command"), option);
 
-	if (parse_one_option(option))
+	if (parse_one_option(state, option))
 		return;
 
-	die("This version of fast-import does not support option: %s", option);
+	die(_("this version of fast-import does not support option: %s"), option);
 }
 
 static void git_pack_config(void)
@@ -3592,63 +3959,165 @@ static void git_pack_config(void)
 	int limit;
 	unsigned long packsizelimit_value;
 
-	if (!git_config_get_ulong("pack.depth", &max_depth)) {
+	if (!repo_config_get_ulong(the_repository, "pack.depth", &max_depth)) {
 		if (max_depth > MAX_DEPTH)
 			max_depth = MAX_DEPTH;
 	}
-	if (!git_config_get_int("pack.indexversion", &indexversion_value)) {
+	if (!repo_config_get_int(the_repository, "pack.indexversion", &indexversion_value)) {
 		pack_idx_opts.version = indexversion_value;
 		if (pack_idx_opts.version > 2)
 			git_die_config(the_repository, "pack.indexversion",
 				       "bad pack.indexVersion=%"PRIu32, pack_idx_opts.version);
 	}
-	if (!git_config_get_ulong("pack.packsizelimit", &packsizelimit_value))
+	if (!repo_config_get_ulong(the_repository, "pack.packsizelimit", &packsizelimit_value))
 		max_packsize = packsizelimit_value;
 
-	if (!git_config_get_int("fastimport.unpacklimit", &limit))
+	if (!repo_config_get_int(the_repository, "fastimport.unpacklimit", &limit))
 		unpack_limit = limit;
-	else if (!git_config_get_int("transfer.unpacklimit", &limit))
+	else if (!repo_config_get_int(the_repository, "transfer.unpacklimit", &limit))
 		unpack_limit = limit;
 
-	git_config(git_default_config, NULL);
+	repo_config(the_repository, git_default_config, NULL);
 }
 
-static const char fast_import_usage[] =
-"git fast-import [--date-format=<f>] [--max-pack-size=<n>] [--big-file-threshold=<n>] [--depth=<n>] [--active-branches=<n>] [--export-marks=<marks.file>]";
+static const char *const fast_import_usage[] = {
+	N_("git fast-import [<options>]"),
+	NULL
+};
 
-static void parse_argv(void)
+static void parse_argv(struct fast_import_state *state)
 {
-	unsigned int i;
+	int argc = parse_options(state->argc, state->argv, state->prefix,
+				 state->option, fast_import_usage,
+				 PARSE_OPT_KEEP_ARGV0);
 
-	for (i = 1; i < global_argc; i++) {
-		const char *a = global_argv[i];
+	if (argc > 1)
+		usage_with_options(fast_import_usage, state->option);
 
-		if (*a != '-' || !strcmp(a, "--"))
-			break;
-
-		if (!skip_prefix(a, "--", &a))
-			die("unknown option %s", a);
-
-		if (parse_one_option(a))
-			continue;
-
-		if (parse_one_feature(a, 0))
-			continue;
-
-		if (skip_prefix(a, "cat-blob-fd=", &a)) {
-			option_cat_blob_fd(a);
-			continue;
-		}
-
-		die("unknown option --%s", a);
-	}
-	if (i != global_argc)
-		usage(fast_import_usage);
-
-	seen_data_command = 1;
+	state->seen_data_command = 1;
 	if (import_marks_file)
 		read_marks();
 	build_mark_map(&sub_marks_from, &sub_marks_to);
+}
+
+static int option_parse_date_format(const struct option *opt UNUSED,
+				    const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_date_format(arg);
+	return 0;
+}
+
+static int option_parse_export_pack_edges(const struct option *opt,
+					  const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_export_pack_edges(opt->value, arg);
+	return 0;
+}
+
+static int option_parse_max_pack_size(const struct option *opt UNUSED,
+				      const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_max_pack_size(arg);
+	return 0;
+}
+
+static int option_parse_big_file_threshold(const struct option *opt UNUSED,
+					   const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_big_file_threshold(arg);
+	return 0;
+}
+
+static int option_parse_signed_commits(const struct option *opt UNUSED,
+				       const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_signed_commits(arg);
+	return 0;
+}
+
+static int option_parse_signed_tags(const struct option *opt UNUSED,
+				    const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_signed_tags(arg);
+	return 0;
+}
+
+static int option_parse_rewrite_submodules_from(const struct option *opt,
+						const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_rewrite_submodules(opt->value, arg, &sub_marks_from);
+	return 0;
+}
+
+static int option_parse_rewrite_submodules_to(const struct option *opt,
+					      const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_rewrite_submodules(opt->value, arg, &sub_marks_to);
+	return 0;
+}
+
+static int option_parse_cat_blob_fd(const struct option *opt,
+				    const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_cat_blob_fd(opt->value, arg);
+	return 0;
+}
+
+static int option_parse_import_marks(const struct option *opt,
+				     const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_import_marks(opt->value, arg, 0, 0);
+	return 0;
+}
+
+static int option_parse_import_marks_if_exists(const struct option *opt,
+					       const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_import_marks(opt->value, arg, 0, 1);
+	return 0;
+}
+
+static int option_parse_export_marks(const struct option *opt,
+				     const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_export_marks(opt->value, arg);
+	return 0;
+}
+
+static int option_parse_depth(const struct option *opt UNUSED,
+			      const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_depth(arg);
+	return 0;
+}
+
+static int option_parse_active_branches(const struct option *opt UNUSED,
+					const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_active_branches(arg);
+	return 0;
+}
+
+static int option_parse_quiet(const struct option *opt UNUSED,
+			      const char *arg UNUSED, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	option_quiet();
+	return 0;
 }
 
 int cmd_fast_import(int argc,
@@ -3656,9 +4125,80 @@ int cmd_fast_import(int argc,
 		    const char *prefix,
 		    struct repository *repo)
 {
-	unsigned int i;
+	struct fast_import_state state;
 
-	show_usage_if_asked(argc, argv, fast_import_usage);
+	struct option fast_import_options[] = {
+		OPT_GROUP(N_("Common")),
+		OPT_CALLBACK_F(0, "date-format", NULL, N_("fmt"),
+			       N_("format of the commit/tag dates"),
+			       PARSE_OPT_NONEG, option_parse_date_format),
+		OPT_BOOL_F(0, "stats", &show_stats,
+			   N_("display some basic statistics (objects, packfiles and memory)"),
+			   PARSE_OPT_NONEG),
+		OPT_CALLBACK_F(0, "quiet", NULL, NULL,
+			       N_("disable the output shown by --stats"),
+			       PARSE_OPT_NOARG | PARSE_OPT_NONEG,
+			       option_parse_quiet),
+		OPT_BOOL_F(0, "force", &force_update,
+			   N_("force updating modified existing branches"), PARSE_OPT_NONEG),
+		OPT_BOOL_F(0, "done", &require_explicit_termination,
+			   N_("require a terminating 'done' command"), PARSE_OPT_NONEG),
+		OPT_CALLBACK_F(0, "max-pack-size", NULL, N_("n"),
+			       N_("maximum size of each output pack file"),
+			       PARSE_OPT_NONEG, option_parse_max_pack_size),
+		OPT_CALLBACK_F(0, "big-file-threshold", NULL, N_("n"),
+			       N_("maximum size of a blob that will be deltified"),
+			       PARSE_OPT_NONEG, option_parse_big_file_threshold),
+		OPT_CALLBACK_F(0, "depth", NULL, N_("n"),
+			       N_("maximum delta depth"),
+			       PARSE_OPT_NONEG, option_parse_depth),
+		OPT_CALLBACK_F(0, "active-branches", NULL, N_("n"),
+			       N_("maximum number of branches to maintain active"),
+			       PARSE_OPT_NONEG, option_parse_active_branches),
+		OPT_GROUP(N_("Marks")),
+		OPT_CALLBACK_F(0, "import-marks", &state, N_("file"),
+			       N_("import marks from <file>"),
+			       PARSE_OPT_NONEG, option_parse_import_marks),
+		OPT_CALLBACK_F(0, "import-marks-if-exists", &state, N_("file"),
+			       N_("import marks from <file> if it exists"),
+			       PARSE_OPT_NONEG, option_parse_import_marks_if_exists),
+		OPT_CALLBACK_F(0, "export-marks", &state, N_("file"),
+			       N_("dump marks to <file>"),
+			       PARSE_OPT_NONEG, option_parse_export_marks),
+		OPT_BOOL(0, "relative-marks", &relative_marks_paths,
+			 N_("are --(import|export)-marks= paths relative to '.git/info/fast-import'?")),
+		OPT_GROUP(N_("Submodule rewrite")),
+		OPT_CALLBACK_F(0, "rewrite-submodules-from", &state, N_("name:filename"),
+			       N_("rewrite object IDs for submodule <name> from <filename>"),
+			       PARSE_OPT_NONEG, option_parse_rewrite_submodules_from),
+		OPT_CALLBACK_F(0, "rewrite-submodules-to", &state, N_("name:filename"),
+			       N_("rewrite object IDs for submodule <name> to <filename>"),
+			       PARSE_OPT_NONEG, option_parse_rewrite_submodules_to),
+		OPT_GROUP(N_("Signing")),
+		OPT_CALLBACK_F(0, "signed-commits", NULL, N_("mode"),
+			       N_("how to handle signed commits"),
+			       PARSE_OPT_NONEG, option_parse_signed_commits),
+		OPT_CALLBACK_F(0, "signed-tags", NULL, N_("mode"),
+			       N_("how to handle signed tags"),
+			       PARSE_OPT_NONEG, option_parse_signed_tags),
+		OPT_HIDDEN_GROUP(N_("Advanced")),
+		OPT_BOOL_F(0, "allow-unsafe-features", &state.allow_unsafe_features,
+			   N_("allow unsafe mark commands from the stream"),
+			   PARSE_OPT_HIDDEN | PARSE_OPT_NONEG),
+		OPT_CALLBACK_F(0, "export-pack-edges", &state, N_("file"),
+			       N_("dump edge commits to <file>"),
+			       PARSE_OPT_HIDDEN | PARSE_OPT_NONEG,
+			       option_parse_export_pack_edges),
+		OPT_CALLBACK_F(0, "cat-blob-fd", &state, N_("fd"),
+			       N_("write some responses to <fd> instead of stdout"),
+			       PARSE_OPT_HIDDEN | PARSE_OPT_NONEG,
+			       option_parse_cat_blob_fd),
+		OPT_END()
+	};
+
+	show_usage_with_options_if_asked(argc, argv, fast_import_usage, fast_import_options);
+
+	fast_import_state_init(&state, argc, argv, prefix, fast_import_options);
 
 	reset_pack_idx_option(&pack_idx_opts);
 	git_pack_config();
@@ -3677,70 +4217,76 @@ int cmd_fast_import(int argc,
 	 * "feature" lines at the start of the stream (which allows the command
 	 * line to override stream data). But we must do an early parse of any
 	 * command-line options that impact how we interpret the feature lines.
+	 *
+	 * NEEDSWORK: This scan only matches the exact "--allow-unsafe-features"
+	 * spelling and stops at the first argument that doesn't start with a
+	 * dash. As parse_options() below also accepts unambiguous abbreviations
+	 * and values separated by a space from their option, the two disagree
+	 * for command lines like "--allow-unsafe" or "--depth 5
+	 * --allow-unsafe-features": parse_options() accepts the option, but
+	 * this scan doesn't see it, so unsafe features from the stream are
+	 * still refused. This errs on the safe side, but should be fixed by
+	 * teaching this scan about the options that take a value.
 	 */
-	for (i = 1; i < argc; i++) {
+	for (int i = 1; i < argc; i++) {
 		const char *arg = argv[i];
 		if (*arg != '-' || !strcmp(arg, "--"))
 			break;
 		if (!strcmp(arg, "--allow-unsafe-features"))
-			allow_unsafe_features = 1;
+			state.allow_unsafe_features = 1;
 	}
 
-	global_argc = argc;
-	global_argv = argv;
-	global_prefix = prefix;
-
 	rc_free = mem_pool_alloc(&fi_mem_pool, cmd_save * sizeof(*rc_free));
-	for (i = 0; i < (cmd_save - 1); i++)
+	for (unsigned int i = 0; i < (cmd_save - 1); i++)
 		rc_free[i].next = &rc_free[i + 1];
 	rc_free[cmd_save - 1].next = NULL;
 
 	start_packfile();
 	set_die_routine(die_nicely);
 	set_checkpoint_signal();
-	while (read_next_command() != EOF) {
+	while (read_next_command(&state) != EOF) {
 		const char *v;
 		if (!strcmp("blob", command_buf.buf))
-			parse_new_blob();
+			parse_new_blob(&state);
 		else if (skip_prefix(command_buf.buf, "commit ", &v))
-			parse_new_commit(v);
+			parse_new_commit(&state, v);
 		else if (skip_prefix(command_buf.buf, "tag ", &v))
-			parse_new_tag(v);
+			parse_new_tag(&state, v);
 		else if (skip_prefix(command_buf.buf, "reset ", &v))
-			parse_reset_branch(v);
+			parse_reset_branch(&state, v);
 		else if (skip_prefix(command_buf.buf, "ls ", &v))
-			parse_ls(v, NULL);
+			parse_ls(&state, v, NULL);
 		else if (skip_prefix(command_buf.buf, "cat-blob ", &v))
-			parse_cat_blob(v);
+			parse_cat_blob(&state, v);
 		else if (skip_prefix(command_buf.buf, "get-mark ", &v))
-			parse_get_mark(v);
+			parse_get_mark(&state, v);
 		else if (!strcmp("checkpoint", command_buf.buf))
-			parse_checkpoint();
+			parse_checkpoint(&state);
 		else if (!strcmp("done", command_buf.buf))
 			break;
 		else if (!strcmp("alias", command_buf.buf))
-			parse_alias();
+			parse_alias(&state);
 		else if (starts_with(command_buf.buf, "progress "))
-			parse_progress();
+			parse_progress(&state);
 		else if (skip_prefix(command_buf.buf, "feature ", &v))
-			parse_feature(v);
+			parse_feature(&state, v);
 		else if (skip_prefix(command_buf.buf, "option git ", &v))
-			parse_option(v);
+			parse_option(&state, v);
 		else if (starts_with(command_buf.buf, "option "))
 			/* ignore non-git options*/;
 		else
-			die("Unsupported command: %s", command_buf.buf);
+			die(_("unsupported command: %s"), command_buf.buf);
 
 		if (checkpoint_requested)
 			checkpoint();
 	}
 
 	/* argv hasn't been parsed yet, do so */
-	if (!seen_data_command)
-		parse_argv();
+	if (!state.seen_data_command)
+		parse_argv(&state);
 
 	if (require_explicit_termination && feof(stdin))
-		die("stream ends early");
+		die(_("stream ends early"));
 
 	end_packfile();
 
@@ -3754,9 +4300,9 @@ int cmd_fast_import(int argc,
 
 	if (show_stats) {
 		uintmax_t total_count = 0, duplicate_count = 0;
-		for (i = 0; i < ARRAY_SIZE(object_count_by_type); i++)
+		for (size_t i = 0; i < ARRAY_SIZE(object_count_by_type); i++)
 			total_count += object_count_by_type[i];
-		for (i = 0; i < ARRAY_SIZE(duplicate_count_by_type); i++)
+		for (size_t i = 0; i < ARRAY_SIZE(duplicate_count_by_type); i++)
 			duplicate_count += duplicate_count_by_type[i];
 
 		fprintf(stderr, "%s statistics:\n", argv[0]);
